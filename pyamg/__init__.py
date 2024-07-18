@@ -5,9 +5,6 @@ import warnings
 import numpy as np
 import scipy as sp
 
-from .version import version_tuple as __version_tuple__
-from .version import version as __version__
-
 from . import (aggregation, amg_core, classical, gallery, krylov, relaxation, util, vis)
 from . import (blackbox, graph, graph_ref, multilevel, strength)
 
@@ -17,10 +14,12 @@ from .aggregation import smoothed_aggregation_solver, rootnode_solver, pairwise_
 from .gallery import demo
 from .blackbox import solve, solver, solver_configuration
 
+import importlib.metadata
+__version__ = importlib.metadata.version(__name__)
+
 __all__ = [
-    'MultilevelSolver',
     '__version__',
-    '__version_tuple__',
+    'MultilevelSolver',
     'aggregation',
     'air_solver',
     'amg_core',
