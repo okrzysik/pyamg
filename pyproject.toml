@@ -53,6 +53,8 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest",
+]
+dev = [
     "ruff",
 ]
 

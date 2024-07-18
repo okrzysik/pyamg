@@ -25,6 +25,13 @@ foreach header : amg_core_headers
   )
 endforeach
 
+py.extension_module('bind_examples',
+    'pyamg/amg_core/tests/bind_examples_bind.cpp',
+    install: true,
+    subdir: 'pyamg/amg_core/tests',
+    dependencies : [pybind11_dep],
+)
+
 install_subdir('pyamg',
   exclude_directories: 'amg_core',   # subdirectory of pyamg
   install_dir: py.get_install_dir(),
