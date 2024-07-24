@@ -149,3 +149,16 @@ ignore-names = [
 docstring-quotes = "double"
 inline-quotes = "single"
 multiline-quotes = "double"
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+omit = [
+    "*tests/*",
+    "*__init__.py",
+    "setup.py",
+    "pyamg/version.py",
+    "pyamg/amg_core/bindthem.py",
+    "pyamg/gallery/demo.py",
+]
