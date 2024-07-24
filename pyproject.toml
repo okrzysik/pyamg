@@ -55,7 +55,12 @@ test = [
     "pytest",
 ]
 dev = [
+    "meson-python",
+    "meson",
+    "ninja",
+    "pybind11",
     "ruff",
+    "pytest",
 ]
 
 [project.urls]
