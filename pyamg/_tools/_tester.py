@@ -1,17 +1,16 @@
 # based on https://github.com/numpy/numpy/blob/main/numpy/_pytesttester.py
 # numpy license: BSD
 # Copyright (c) 2005-2024, NumPy Developers.
-"""Test runner from numpy.
-"""
+"""Test runner."""
 import os
 import sys
 
 
 def _show_pyamg_info():
-    import pytest
-    import scipy as sp
-    import numpy as np
-    import pyamg
+    import pytest       # noqa: PLC0415
+    import scipy as sp  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+    import pyamg        # noqa: PLC0415
 
     sysversion = sys.version.replace('\n', '')
     print(f'Python version: {sysversion}')
@@ -22,8 +21,7 @@ def _show_pyamg_info():
 
 
 class PytestTester:
-    """
-    Pytest test runner.
+    """Pytest test runner.
 
     This class is made available in ``pyamg._shared.testing``, and a test
     function is typically added to a package's __init__.py like so::
@@ -60,8 +58,7 @@ class PytestTester:
         durations=-1,
         tests=None,
     ):
-        """
-        Run tests for module using pytest.
+        """Run tests for module using pytest.
 
         Parameters
         ----------
@@ -88,8 +85,9 @@ class PytestTester:
         -------
         result : bool
             Return True on success, false otherwise.
+
         """
-        import pytest
+        import pytest  # noqa: PLC0415
 
         module = sys.modules[self.module_name]
         module_path = os.path.abspath(module.__path__[0])
@@ -131,7 +129,7 @@ class PytestTester:
         if tests is None:
             tests = [self.module_name]
 
-        pytest_args += ['--pyargs'] + list(tests)
+        pytest_args += ['--pyargs', *list(tests)]
 
         # run tests.
         _show_pyamg_info()
