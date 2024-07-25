@@ -95,43 +95,43 @@ class PytestTester:
         module_path = os.path.abspath(module.__path__[0])
 
         # setup the pytest arguments
-        pytest_args = ["-l"]
+        pytest_args = ['-l']
 
         # offset verbosity. The "-q" cancels a "-v".
-        pytest_args += ["-q"]
+        pytest_args += ['-q']
 
         # Filter out annoying import messages. Want these in both develop and
         # release mode.
         pytest_args += [
-            "-W ignore:Not importing directory",
-            "-W ignore:numpy.dtype size changed",
-            "-W ignore:numpy.ufunc size changed",
+            '-W ignore:Not importing directory',
+            '-W ignore:numpy.dtype size changed',
+            '-W ignore:numpy.ufunc size changed',
         ]
 
         if doctests:
-            raise ValueError("Doctests not supported")
+            raise ValueError('Doctests not supported')
 
         if extra_argv:
             pytest_args += list(extra_argv)
 
         if verbose > 1:
-            pytest_args += ["-" + "v" * (verbose - 1)]
+            pytest_args += ['-' + 'v' * (verbose - 1)]
 
         if coverage:
-            pytest_args += ["--cov=" + module_path]
+            pytest_args += ['--cov=' + module_path]
 
-        if label == "fast":
-            pytest_args += ["-m", "not slow"]
-        elif label != "full":
-            pytest_args += ["-m", label]
+        if label == 'fast':
+            pytest_args += ['-m', 'not slow']
+        elif label != 'full':
+            pytest_args += ['-m', label]
 
         if durations >= 0:
-            pytest_args += [f"--durations={durations}"]
+            pytest_args += [f'--durations={durations}']
 
         if tests is None:
             tests = [self.module_name]
 
-        pytest_args += ["--pyargs"] + list(tests)
+        pytest_args += ['--pyargs'] + list(tests)
 
         # run tests.
         _show_pyamg_info()
