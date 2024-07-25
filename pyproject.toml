@@ -155,15 +155,20 @@ docstring-quotes = "double"
 inline-quotes = "single"
 multiline-quotes = "double"
 
+[tool.pytest.ini_options]
+addopts = [
+    "--cov=pyamg",
+    "--cov-report=xml",
+]
+
 [tool.coverage.run]
 branch = true
-
-[tool.coverage.report]
+source = [
+    "pyamg",
+]
 omit = [
     "*tests/*",
     "*__init__.py",
-    "setup.py",
-    "pyamg/version.py",
     "pyamg/amg_core/bindthem.py",
     "pyamg/gallery/demo.py",
 ]
