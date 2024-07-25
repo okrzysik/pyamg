@@ -1,10 +1,5 @@
 """PyAMG: Algebraic Multigrid Solvers in Python."""
 
-import re
-import warnings
-import numpy as np
-import scipy as sp
-
 from . import (aggregation, amg_core, classical, gallery, krylov, relaxation, util, vis)
 from . import (blackbox, graph, graph_ref, multilevel, strength)
 
@@ -18,8 +13,8 @@ import importlib.metadata
 __version__ = importlib.metadata.version(__name__)
 
 __all__ = [
-    '__version__',
     'MultilevelSolver',
+    '__version__',
     'aggregation',
     'air_solver',
     'amg_core',
