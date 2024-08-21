@@ -52,15 +52,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = [
-    "pytest",
-]
-dev = [
+build = [
     "meson-python",
     "meson",
     "ninja",
     "pybind11",
+]
+style = [
     "ruff",
+]
+test = [
     "pytest",
 ]
 
