@@ -157,12 +157,6 @@ docstring-quotes = "double"
 inline-quotes = "single"
 multiline-quotes = "double"
 
-[tool.pytest.ini_options]
-addopts = [
-    "--cov=pyamg",
-    "--cov-report=xml",
-]
-
 [tool.coverage.run]
 branch = true
 source = [
