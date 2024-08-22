@@ -1,5 +1,5 @@
 project('pyamg', 'cpp',
-  version: run_command(find_program('python3'), '-m', 'versioningit').stdout().strip(),
+  version: run_command(find_program('python3'), '-m', 'versioningit', check: true).stdout().strip(),
   license: 'MIT',
   default_options: ['cpp_std=c++11'],
 )
