@@ -1,3 +1,5 @@
+// This file is a copy of that on the "rel-air" branch from commit 609394f4458e35e9c6e1b1fffc1fe08435b7cff9
+
 #ifndef LINALG_H
 #define LINALG_H
 
@@ -1060,7 +1062,7 @@ void csc_scale_rows(const I n_row,
  * num_rows : int
  *     number of rows in A
  * theta : float
- *     strength of connection tolerance
+ *     stength of connection tolerance
  * Ap : array
  *     CSR row pointer
  * Aj : array
@@ -1176,7 +1178,7 @@ std::vector<T> QR(T A[],
                   const I &n,
                   const I is_col_major)
 {
-    // Function pointer for row or column major matrices
+    // Funciton pointer for row or column major matrices
     I (*get_ind)(const I, const I, const I);
     const I *C;
     if (is_col_major) {
@@ -1429,7 +1431,7 @@ void lower_tri_solve(const T L[],
  * Returns
  * -------
  * x : vector<double>
- *    Solution to constrained least squares problem.
+ *    Solution to constrained least sqaures problem.
  *
  * Notes
  * -----
@@ -1458,7 +1460,7 @@ void least_squares(T A[],
     // Take QR of A
     std::vector<T> Q = QR(A,m,n,is_col_major);
 
-    // Multiply right hand side, b:= Q^T*b. Have to make new vector, rhs.
+    // Multiply right hand side, b:= Q^T*b. Have to make new vetor, rhs.
     std::vector<T> rhs(m,0);
     for (I i=0; i<m; i++) {
         for (I k=0; k<m; k++) {
@@ -1469,5 +1471,127 @@ void least_squares(T A[],
     // Solve upper triangular system, store solution in x.
     upper_tri_solve(A,&rhs[0],x,m,n,is_col_major);
 }
+
+
+/* Compute Ax=b for dense mxn matrix A. 
+*/
+template<class I, class T>
+inline void matvec(const T A[], const I m, const I n,
+    const T x[], T b[], const I is_col_major)
+{
+    // Function pointer for row or column major matrices
+    I (*get_ind)(const I, const I, const I);
+    const I *C;
+    if (is_col_major) {
+        get_ind = &col_major;
+        C = &m;
+    }
+    else {
+        get_ind = &row_major;
+        C = &n;
+    }
+
+    // Multiply right hand side, b:= A*x.
+    for (I i=0; i<m; i++) {
+        b[i] = 0;
+        for (I k=0; k<n; k++) {
+            b[i] += x[k] * A[get_ind(i,k,*C)];
+        }
+    }
+}
+
+
+/* Compute A^Tx=b for dense mxn matrix A. 
+*/
+template<class I, class T>
+inline void matvecT(const T A[], const I m, const I n,
+    const T x[], T b[], const I is_col_major)
+{
+    // Function pointer for row or column major matrices
+    I (*get_ind)(const I, const I, const I);
+    const I *C;
+    if (is_col_major) {
+        get_ind = &col_major;
+        C = &m;
+    }
+    else {
+        get_ind = &row_major;
+        C = &n;
+    }
+
+    // Multiply right hand side, b:= A^t*x.
+    for (I i=0; i<m; i++) {
+        b[i] = 0;
+        for (I k=0; k<n; k++) {
+            b[i] += x[k] * A[get_ind(k,i,*C)];
+        }
+    }
+}
+
+// Construct inverse of upper triangular matrix
+template<class I, class T>
+std::vector<T> inverseUpperTriangular(const T U[], I n,
+    bool is_col_major = false) {
+
+    // Function pointer for row or column major matrices
+    I (*get_ind)(const I, const I, const I);
+    if (is_col_major) {
+        get_ind = &col_major;
+    }
+    else {
+        get_ind = &row_major;
+    }
+
+    std::vector<T> invT(n * n, 0.0);
+
+    // Construct the identity matrix
+    for (I i = 0; i < n; ++i) {
+        invT[get_ind(i,i,n)] = 1.0;
+    }
+
+    // Perform back substitution to find the inverse
+    for (I j = n - 1; j >= 0; --j) {
+        T diagonalElement = U[get_ind(j,j,n)];
+
+        // Scale the row to make the diagonal element 1
+        for (I k = 0; k < n; ++k) {
+            invT[get_ind(j,k,n)] /= diagonalElement;
+        }
+
+        // Update the rest of the matrix
+        for (I i = j - 1; i >= 0; --i) {
+            T factor = U[get_ind(i,j,n)];
+            for (I k = 0; k < n; ++k) {
+                invT[get_ind(i,k,n)] -= factor * invT[get_ind(j,k,n)];
+            }
+        }
+    }
+
+    return invT;
+}
+
+// 
+// Notes: *** ONLY WORKS FOR ROW MAJOR MATRICES *** 
+// A is modified in place for QR decomp
+template<class I, class T>
+std::vector<T> matInverse(T A[], const I &n)
+{
+    // Function pointer for row or column major matrices
+    I (*get_ind)(const I, const I, const I);
+    get_ind = &row_major;
+    bool is_col_major = false;
+
+    // Take QR of A
+    std::vector<T> Q = QR<I,T>(A,n,n,is_col_major);
+
+    // Form A^(-1) = (QR)^(-1) = R^(-1)Q^T
+    std::vector<T> Ainv(n*n);
+    std::vector<T> Rinv = inverseUpperTriangular<I,T>(A, n, is_col_major);
+    // Compute R^(-1)Q^T mat-mat
+    gemm(&Rinv[0], n, n, 'F' ,&Q[0], n, n, 'F',&Ainv[0], n, n, 'F', 'T');
+
+    return Ainv;
+}
+
 
 #endif
