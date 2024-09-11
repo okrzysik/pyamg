@@ -19,7 +19,8 @@ supporting C++ code for performance critical operations.
 from setuptools import setup
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 
-amg_core_headers = ['air',
+amg_core_headers = ['adaptive_relaxation',
+                    'air',
                     'evolution_strength',
                     'graph',
                     'krylov',

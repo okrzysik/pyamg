@@ -5,6 +5,9 @@ instantiate:
     - [int, "std::complex<float>", float]
     - [int, "std::complex<double>", double]
   functions:
+    - block_gauss_seidel_gen_inv
+    - block_gauss_seidel_gen_splu
+    - block_gauss_seidel_gen_inexact
     - apply_householders
     - householder_hornerscheme
     - apply_givens
@@ -40,6 +43,9 @@ instantiate:
     - [int,float]
     - [int,double]
   functions:
+    - lsa_strength
+    - lsa_splitting
+    - operator_dependent_interpolation
     - fit_candidates_real
     - rs_direct_interpolation_pass2
     - cr_helper

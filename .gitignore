@@ -1,3 +1,6 @@
+# OAK files to ignore
+.vscode/
+
 # files
 *.pyc
 *.bak

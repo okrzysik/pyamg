@@ -1,3 +1,4 @@
+./bindthem.py adaptive_relaxation.h
 ./bindthem.py air.h
 ./bindthem.py evolution_strength.h
 ./bindthem.py graph.h

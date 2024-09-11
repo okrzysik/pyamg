@@ -1,5 +1,11 @@
 """amg_core - a C++ implementation of AMG-related routines."""
 
+from .adaptive_relaxation import (lsa_splitting,
+                                lsa_strength,
+                                block_gauss_seidel_gen_inv,
+                                block_gauss_seidel_gen_splu,
+                                block_gauss_seidel_gen_inexact,
+                                operator_dependent_interpolation)
 from .evolution_strength import (apply_absolute_distance_filter, apply_distance_filter,
                                  min_blocks, evolution_strength_helper,
                                  incomplete_mat_mult_csr)
@@ -39,6 +45,13 @@ from .air import (one_point_interpolation, approx_ideal_restriction_pass1,
                   approx_ideal_restriction_pass2, block_approx_ideal_restriction_pass2)
 
 __all__ = [
+    # adaptive_relaxation
+    'lsa_splitting',
+    'lsa_strength',
+    'block_gauss_seidel_gen_inv',
+    'block_gauss_seidel_gen_splu',
+    'block_gauss_seidel_gen_inexact',
+    'operator_dependent_interpolation',
     # evolution_strength
     'apply_absolute_distance_filter',
     'apply_distance_filter',
