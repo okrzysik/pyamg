@@ -45,6 +45,7 @@ instantiate:
   functions:
     - lsa_strength
     - lsa_splitting
+    - extract_and_invert_constant_subblocks
     - operator_dependent_interpolation
     - fit_candidates_real
     - rs_direct_interpolation_pass2

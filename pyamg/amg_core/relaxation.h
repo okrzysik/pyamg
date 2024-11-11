@@ -39,7 +39,7 @@
  * only a subset of the unknowns.  A forward sweep is implemented
  * with gauss_seidel(Ap, Aj, Ax, x, b, 0, N, 1) where N is the
  * number of rows in matrix A.  Similarly, a backward sweep is
- * implemented with gauss_seidel(Ap, Aj, Ax, x, b, N, -1, -1).
+ * implemented with gauss_seidel(Ap, Aj, Ax, x, b, N, -1, -1). // NOTE: This seems to be a typo, the row_start should be "N-1" not "N" for a backward sweep.
  */
 template<class I, class T, class F>
 void gauss_seidel(const I Ap[], const int Ap_size,
@@ -1272,6 +1272,102 @@ void extract_subblocks(const I Ap[], const int Ap_size,
             }
 
             Tx_offset += row_length;
+        }
+    }
+}
+
+
+// Almost identical to the above extract_subblocks function, just takes the extra step of inverting the blocks themselves. Also assumes a constant stencil during the inversion, with the first subblock being representative of the constant stencil. 
+// Note that no simplification based on the stencil being constant is applied during the subddomain extraction process, since in my tests it seemed like the overwhelmingly time-consuming part of the code was the inversion not the extraction.
+// Note that the F templated argument from the function has been removed, and that the templated arguments in instantiate.yml are different to the above class in order to ensure they're compatible with matInverse from linalg.h
+template<class I, class T>
+void extract_and_invert_constant_subblocks(const I Ap[], const int Ap_size,
+                                           const I Aj[], const int Aj_size,
+                                           const T Ax[], const int Ax_size,
+                                                 T Tx[], const int Tx_size,
+                                           const I Tp[], const int Tp_size,
+                                           const I Sj[], const int Sj_size,
+                                           const I Sp[], const int Sp_size,
+                                           const I nsdomains,
+                                           const I nrows)
+{
+    // Initialize Tx to zero
+    T zero = 0.0;
+    std::fill(&(Tx[0]), &(Tx[Tp[nsdomains]]), zero);
+
+    // Loop over each subdomain
+    for(I i = 0; i < nsdomains; i++) {
+        // Calculate the smallest and largest column index for this
+        // diagonal block
+        I lower = Sj[Sp[i]];
+        I upper = Sj[Sp[i+1]-1];
+
+        I Tx_offset = Tp[i];
+        I row_length = Sp[i+1] - Sp[i];
+
+        // Loop over subdomain i
+        for(I j = Sp[i]; j < Sp[i+1]; j++) {
+            // Peel off this row from A and insert into Tx
+            I row = Sj[j];
+            I start = Ap[row];
+            I end = Ap[row+1];
+            I local_col = 0;
+            I placeholder = Sp[i];
+
+            for(I k = start; k < end; k++) {
+                I col = Aj[k];
+
+                // Must decide if col is a member of this subdomain, and while
+                // doing so, track the current local column number from 0 to
+                // row_length
+                if ((col >= lower) && (col <= upper) ) {
+                    while(placeholder < Sp[i+1]){
+                        if(Sj[placeholder] == col) {
+                            //insert into Tx
+                            Tx[Tx_offset + local_col] = Ax[k];
+                            local_col++;
+                            placeholder++;
+                            break;
+                        }
+                        else if (Sj[placeholder] > col ){
+                            break;
+                        }
+                        else{
+                            local_col++;
+                            placeholder++;
+                        }
+                    }
+                }
+            }
+
+            Tx_offset += row_length;
+        }
+    }
+
+    // All subblocks have been extracted, now invert them.
+    // Look at the first subdomain, and assume this is representative of the constant stencil. This should be the case since the subdomain can only differ at a boundary where it may have been truncated, which would result in it being a different size.
+    I i = 0;
+    I blocksize0 = Sp[i+1] - Sp[i];
+    // Invert Tx in place.
+    I Tx_offset0 = Tp[i];
+    std::vector<T> Ainv0 = matInverse(&Tx[Tp[i]], blocksize0);
+    for (I count = 0; count < blocksize0 * blocksize0; count++) {
+        Tx[Tx_offset0+count] = Ainv0[count];
+    }
+
+    // Invert each subdomain, assuming a constant stencil such that any subdomain the same size as the first one has the same stencil. 
+    for(I i = 1; i < nsdomains; i++) {
+        I blocksize = Sp[i+1] - Sp[i];
+        I Tx_offset = Tp[i];
+        if (blocksize == blocksize0) {
+            for (I count = 0; count < blocksize0 * blocksize0; count++) {
+                Tx[Tx_offset+count] = Ainv0[count];
+            }
+        } else {
+            std::vector<T> Ainv = matInverse(&Tx[Tx_offset], blocksize);
+            for (I count = 0; count < blocksize * blocksize; count++) {
+                Tx[Tx_offset+count] = Ainv[count];
+            }
         }
     }
 }

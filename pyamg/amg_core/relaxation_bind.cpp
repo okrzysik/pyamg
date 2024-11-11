@@ -586,6 +586,47 @@ void _extract_subblocks(
                                       );
 }
 
+template<class I, class T>
+void _extract_and_invert_constant_subblocks(
+      py::array_t<I> & Ap,
+      py::array_t<I> & Aj,
+      py::array_t<T> & Ax,
+      py::array_t<T> & Tx,
+      py::array_t<I> & Tp,
+      py::array_t<I> & Sj,
+      py::array_t<I> & Sp,
+        const I nsdomains,
+            const I nrows
+                                            )
+{
+    auto py_Ap = Ap.unchecked();
+    auto py_Aj = Aj.unchecked();
+    auto py_Ax = Ax.unchecked();
+    auto py_Tx = Tx.mutable_unchecked();
+    auto py_Tp = Tp.unchecked();
+    auto py_Sj = Sj.unchecked();
+    auto py_Sp = Sp.unchecked();
+    const I *_Ap = py_Ap.data();
+    const I *_Aj = py_Aj.data();
+    const T *_Ax = py_Ax.data();
+    T *_Tx = py_Tx.mutable_data();
+    const I *_Tp = py_Tp.data();
+    const I *_Sj = py_Sj.data();
+    const I *_Sp = py_Sp.data();
+
+    return extract_and_invert_constant_subblocks<I, T>(
+                      _Ap, Ap.shape(0),
+                      _Aj, Aj.shape(0),
+                      _Ax, Ax.shape(0),
+                      _Tx, Tx.shape(0),
+                      _Tp, Tp.shape(0),
+                      _Sj, Sj.shape(0),
+                      _Sp, Sp.shape(0),
+                nsdomains,
+                    nrows
+                                                       );
+}
+
 template<class I, class T, class F>
 void _overlapping_schwarz_csr(
       py::array_t<I> & Ap,
@@ -661,6 +702,7 @@ PYBIND11_MODULE(relaxation, m) {
     block_jacobi_indexed
     block_gauss_seidel
     extract_subblocks
+    extract_and_invert_constant_subblocks
     overlapping_schwarz_csr
     )pbdoc";
 
@@ -711,7 +753,7 @@ to implement standard forward and backward sweeps, or sweeping
 only a subset of the unknowns.  A forward sweep is implemented
 with gauss_seidel(Ap, Aj, Ax, x, b, 0, N, 1) where N is the
 number of rows in matrix A.  Similarly, a backward sweep is
-implemented with gauss_seidel(Ap, Aj, Ax, x, b, N, -1, -1).)pbdoc");
+implemented with gauss_seidel(Ap, Aj, Ax, x, b, N, -1, -1). // NOTE: This seems to be a typo, the row_start should be "N-1" not "N" for a backward sweep.)pbdoc");
 
     m.def("bsr_gauss_seidel", &_bsr_gauss_seidel<int, float, float>,
         py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("x").noconvert(), py::arg("b").noconvert(), py::arg("row_start"), py::arg("row_stop"), py::arg("row_step"), py::arg("blocksize"));
@@ -1254,6 +1296,15 @@ nrows : int
 Returns
 -------
 Nothing, Tx will be modified inplace)pbdoc");
+
+    m.def("extract_and_invert_constant_subblocks", &_extract_and_invert_constant_subblocks<int, float>,
+        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("Tx").noconvert(), py::arg("Tp").noconvert(), py::arg("Sj").noconvert(), py::arg("Sp").noconvert(), py::arg("nsdomains"), py::arg("nrows"));
+    m.def("extract_and_invert_constant_subblocks", &_extract_and_invert_constant_subblocks<int, double>,
+        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("Tx").noconvert(), py::arg("Tp").noconvert(), py::arg("Sj").noconvert(), py::arg("Sp").noconvert(), py::arg("nsdomains"), py::arg("nrows"),
+R"pbdoc(
+Almost identical to the above extract_subblocks function, just takes the extra step of inverting the blocks themselves. Also assumes a constant stencil during the inversion, with the first subblock being representative of the constant stencil.
+Note that no simplification based on the stencil being constant is applied during the subddomain extraction process, since in my tests it seemed like the overwhelmingly time-consuming part of the code was the inversion not the extraction.
+Note that the F templated argument from the function has been removed, and that the templated arguments in instantiate.yml are different to the above class in order to ensure they're compatible with matInverse from linalg.h)pbdoc");
 
     m.def("overlapping_schwarz_csr", &_overlapping_schwarz_csr<int, float, float>,
         py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("x").noconvert(), py::arg("b").noconvert(), py::arg("Tx").noconvert(), py::arg("Tp").noconvert(), py::arg("Sj").noconvert(), py::arg("Sp").noconvert(), py::arg("nsdomains"), py::arg("nrows"), py::arg("row_start"), py::arg("row_stop"), py::arg("row_step"));
