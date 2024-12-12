@@ -9,6 +9,56 @@
 namespace py = pybind11;
 
 template<class I, class T>
+void _optimal_smoother(
+      py::array_t<I> & Ap,
+      py::array_t<I> & Aj,
+      py::array_t<T> & Ax,
+py::array_t<I> & smoother_ID,
+   py::array_t<T> & modes
+                       )
+{
+    auto py_Ap = Ap.unchecked();
+    auto py_Aj = Aj.unchecked();
+    auto py_Ax = Ax.unchecked();
+    auto py_smoother_ID = smoother_ID.mutable_unchecked();
+    auto py_modes = modes.unchecked();
+    const I *_Ap = py_Ap.data();
+    const I *_Aj = py_Aj.data();
+    const T *_Ax = py_Ax.data();
+    I *_smoother_ID = py_smoother_ID.mutable_data();
+    const T *_modes = py_modes.data();
+
+    return optimal_smoother<I, T>(
+                      _Ap, Ap.shape(0),
+                      _Aj, Aj.shape(0),
+                      _Ax, Ax.shape(0),
+             _smoother_ID, smoother_ID.shape(0),
+                   _modes, modes.shape(0)
+                                  );
+}
+
+template<class I, class T>
+void _optimal_smoother_adjacency(
+py::array_t<I> & smoother_ID,
+      py::array_t<I> & Sp,
+      py::array_t<I> & Sj
+                                 )
+{
+    auto py_smoother_ID = smoother_ID.unchecked();
+    auto py_Sp = Sp.mutable_unchecked();
+    auto py_Sj = Sj.mutable_unchecked();
+    const I *_smoother_ID = py_smoother_ID.data();
+    I *_Sp = py_Sp.mutable_data();
+    I *_Sj = py_Sj.mutable_data();
+
+    return optimal_smoother_adjacency<I, T>(
+             _smoother_ID, smoother_ID.shape(0),
+                      _Sp, Sp.shape(0),
+                      _Sj, Sj.shape(0)
+                                            );
+}
+
+template<class I, class T>
 void _operator_dependent_interpolation(
       py::array_t<I> & Ap,
       py::array_t<I> & Aj,
@@ -316,6 +366,8 @@ PYBIND11_MODULE(adaptive_relaxation, m) {
 
     Methods
     -------
+    optimal_smoother
+    optimal_smoother_adjacency
     operator_dependent_interpolation
     lsa_splitting
     lsa_strength
@@ -326,6 +378,20 @@ PYBIND11_MODULE(adaptive_relaxation, m) {
 
     py::options options;
     options.disable_function_signatures();
+
+    m.def("optimal_smoother", &_optimal_smoother<int, float>,
+        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("modes").noconvert());
+    m.def("optimal_smoother", &_optimal_smoother<int, double>,
+        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("modes").noconvert(),
+R"pbdoc(
+)pbdoc");
+
+    m.def("optimal_smoother_adjacency", &_optimal_smoother_adjacency<int, float>,
+        py::arg("smoother_ID").noconvert(), py::arg("Sp").noconvert(), py::arg("Sj").noconvert());
+    m.def("optimal_smoother_adjacency", &_optimal_smoother_adjacency<int, double>,
+        py::arg("smoother_ID").noconvert(), py::arg("Sp").noconvert(), py::arg("Sj").noconvert(),
+R"pbdoc(
+)pbdoc");
 
     m.def("operator_dependent_interpolation", &_operator_dependent_interpolation<int, float>,
         py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("Pp").noconvert(), py::arg("Pj").noconvert(), py::arg("Px").noconvert(), py::arg("n"));

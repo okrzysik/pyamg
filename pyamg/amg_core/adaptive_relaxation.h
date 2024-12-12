@@ -5,11 +5,359 @@
 #include "linalg.h"
 #include <list>     // Need lists for the splitting algorithm.
 
+#include <math.h>
+#include <complex> // Needed for LFA stuff
+
 
 template<class I>
 inline I index_from_grid_inds(const I i, const I j, const I n) {
     return i + j * (n - 1);
 }
+
+
+
+template<class I, class T>
+void nine_point_prec_stencil(T M_stencil[], const I smoother_ID, const T A_stencil[])
+{
+    // Initialize M to zero
+    memset(M_stencil, 0.0, 9 * sizeof(M_stencil[0]));
+    switch (smoother_ID) {
+        // point
+        case 0:
+            M_stencil[0] = A_stencil[0];
+            M_stencil[1] = A_stencil[1];
+            M_stencil[2] = A_stencil[2];
+            M_stencil[3] = A_stencil[3];
+            M_stencil[4] = A_stencil[4];
+            break;
+        // x-line
+        case 1:
+            M_stencil[0] = A_stencil[0];
+            M_stencil[1] = A_stencil[1];
+            M_stencil[2] = A_stencil[2];
+            M_stencil[3] = A_stencil[3];
+            M_stencil[4] = A_stencil[4];
+            M_stencil[5] = A_stencil[5];
+            break;
+        // 45-line
+        case 2:
+            M_stencil[0] = A_stencil[0];
+            M_stencil[1] = A_stencil[1];
+            M_stencil[2] = A_stencil[2];
+            M_stencil[4] = A_stencil[4];
+            M_stencil[5] = A_stencil[5];
+            M_stencil[8] = A_stencil[8];
+            break;
+        // y-line
+        case 3:
+            M_stencil[0] = A_stencil[0];
+            M_stencil[1] = A_stencil[1];
+            M_stencil[3] = A_stencil[3];
+            M_stencil[4] = A_stencil[4];
+            M_stencil[6] = A_stencil[6];
+            M_stencil[7] = A_stencil[7];
+            break;
+        // 135-line
+        case 4:
+            M_stencil[0] = A_stencil[0];
+            M_stencil[1] = A_stencil[1];
+            M_stencil[2] = A_stencil[2];
+            M_stencil[3] = A_stencil[3];
+            M_stencil[4] = A_stencil[4];
+            M_stencil[6] = A_stencil[6];
+            break;
+        default:
+            std::cout << "error... smoother_ID not recognised...\n";
+            break;
+    }
+}
+
+/* Given offsets i and j, return index into 9-point stencil. Note that here i and j are offsets about zero in the hortizontal and vertical directions respectively. */
+template<class I>
+I nine_point_stencil_index(const I i, const I j)
+{
+    if (abs(i) > 1 || abs(j) > 1) {
+        std::cout << "Error: stencil isn't 9 point.";
+        std::cout << "  (i,j)=(" << i << "," << j << ")";
+
+    }
+
+    I index = 0;
+    switch (j) {
+        case -1:
+            switch (i) {
+                case -1: index = 0; break;
+                case  0: index = 1; break;
+                case  1: index = 2; break;
+                default: index = -1; break;
+            }
+            break;
+        case 0:
+            switch (i) {
+                case -1: index = 3; break;
+                case  0: index = 4; break;
+                case  1: index = 5; break;
+                default: index = -1; break;
+            }
+            break;
+        case 1:
+            switch (i) {
+                case -1: index = 6; break;
+                case  0: index = 7; break;
+                case  1: index = 8; break;
+                default: index = -1; break;
+            }
+            break;
+        default: index = -1; break;
+    }
+    return index;
+}
+
+// Assumed stencil is ordered west to east and south to north
+template<class T>
+std::complex<T> nine_point_fourier_symbol(const T A[], const T omega1, const T omega2)
+{
+    // imaginary unit
+    const std::complex<T> i(0.0,1.0); 
+    // Compute symbol
+    std::complex<T> A_tilde =     A[6] * std::exp(i*(-omega1 + omega2))  // NW
+                                + A[7] * std::exp(i*(        + omega2))  // N
+                                + A[8] * std::exp(i*(+omega1 + omega2))  // NE
+                                + A[3] * std::exp(i*(-omega1         ))  // W
+                                + A[4]                                    // C
+                                + A[5] * std::exp(i*(+omega1         ))  // E
+                                + A[0] * std::exp(i*(-omega1 - omega2))  // SW
+                                + A[1] * std::exp(i*(        - omega2))  // S
+                                + A[2] * std::exp(i*(+omega1 - omega2));  // SE
+    return A_tilde;
+}
+
+
+
+
+
+/* A is assumed ordered row-wise lexicographically with n-1 interior DOFs in either direction 
+
+At every point, A is assumed to have 9-point stencil
+*/
+template<class I, class T>
+void optimal_smoother(const I Ap[], const int Ap_size, 
+                         const I Aj[], const int Aj_size,
+                         const T Ax[], const int Ax_size,
+                               I smoother_ID[], const int smoother_ID_size, // smoother ID's need to be pre-allocated
+                         const T modes[], const int modes_size) // Frequencies of modes to optimize over. Blocked in x and y pairs
+{
+
+    I num_modes = modes_size / 2;
+
+    I num_smoothers = 5; // point, x, 45, y, 135 
+
+    I N = Ap_size - 1; // Total number of DOFs.
+    I n = sqrt(N) + 1; // N = (n-1)^2 for n-1 DOFs in each direction
+
+    // 9-point stencil for each DOF
+    T A_stencil[9];
+    // 9-point stencil for associated preconditioner
+    T M_stencil[9];
+
+    for (I dof = 0; dof < N; dof++) {
+
+        // Zero out all entries in the stencil
+        memset(A_stencil, 0.0, 9 * sizeof(A_stencil[0]));
+        
+        // Grid indices of current dof
+        I j = dof / (n-1); // Note the integer division
+        I i = dof - j * (n-1); 
+
+        // Get 9-point stencil for this DOF
+        // Loop over all columns connected to DOF
+        for (I col_idx = Ap[dof]; col_idx < Ap[dof+1]; col_idx++) {
+
+            // global index of connection
+            I col = Aj[col_idx];
+            T Aij = Ax[col_idx];
+
+            // Grid indices of connection
+            I j_col = col / (n-1);
+            I i_col = col - j_col * (n-1);
+
+            // if (dof == 0) {
+            //     std::cout << col << ", " << Aij << ", " << i_col << ", " << j_col << ", " << nine_point_stencil_index(i_col - i, j_col - j) << "\n"; 
+            // }
+
+            // Instert Aij into appropriate place based on grid index offsets
+            A_stencil[nine_point_stencil_index(i_col - i, j_col - j)] = Aij;
+        }
+
+        // if (dof == 0) {
+        //     for (int i = 0; i < 9; i++) std::cout << A_stencil[i] << ", ";
+        //     std::cout << "\n";
+        // }
+
+        // Test A on RHFM
+        std::complex<T> A_action[num_modes];
+        for (I mode = 0; mode < num_modes; mode++) {
+            A_action[mode] = nine_point_fourier_symbol(A_stencil, modes[2*mode], modes[2*mode+1]);
+        }
+
+        // Test each of the preconditioners on the RHFM
+        const std::complex<T> one(1.0,0.0); 
+        T MU[num_smoothers] = { 0.0 };
+        std::complex<T> M_action[num_modes];
+        for (I smoother = 0; smoother < num_smoothers; smoother++) {
+            nine_point_prec_stencil(M_stencil, smoother, A_stencil);
+
+            // Test M on RHFM
+            for (I mode = 0; mode < num_modes; mode++) {
+                M_action[mode] = nine_point_fourier_symbol(M_stencil, modes[2*mode], modes[2*mode+1]);
+            }
+
+            T S_max = 0.0;
+            // Compute approximate smoothing factor by maximizing action of smoother on RHFM
+            for (I mode = 0; mode < num_modes; mode++) {
+                T S_temp = std::abs( one - A_action[mode]/M_action[mode] );
+                if (S_temp > S_max) {S_max = S_temp;}
+            }
+
+            MU[smoother] = S_max;
+        }
+
+        // Find smoother with minimum approximate smoothing factor
+        I min_smoother = 0;
+        T mu_min = MU[0];
+        for (I smoother = 1; smoother < num_smoothers; smoother++) {
+            if (MU[smoother] < mu_min) {mu_min = MU[smoother]; min_smoother = smoother;}
+        }
+
+        // Store minimum smoother
+        smoother_ID[dof] = min_smoother;
+
+    } // finished processing current DOF
+
+    
+    // If a boundary-adjacent point uses anything other than a line parallel to the boundary then force it to use a point smoother. Force all corners to be point smoothers. This simplifies the implementation below and shouldn't really mess anything up, I think...
+    smoother_ID[index_from_grid_inds(0,   0,   n)] = 0; // SW
+    smoother_ID[index_from_grid_inds(n-2, 0,   n)] = 0; // SE
+    smoother_ID[index_from_grid_inds(0,   n-2, n)] = 0; // NW
+    smoother_ID[index_from_grid_inds(n-2, n-2, n)] = 0; // NE
+
+    // West boundary. Set to point unless a y-line smoother already
+    //I i = 0;
+    for (I j = 1; j < n-2; j++) {
+        I ind = index_from_grid_inds(0, j, n);
+        //if (smoother_ID[ind] != 3) smoother_ID[ind] = 0;
+        smoother_ID[ind] = 0;
+    }
+
+    // East boundary. Set to point unless a y-line smoother already
+    //I i = n-2;
+    for (I j = 1; j < n-2; j++) {
+        I ind = index_from_grid_inds(n-2, j, n);
+        //if (smoother_ID[ind] != 3) smoother_ID[ind] = 0;
+        smoother_ID[ind] = 0;
+    }
+
+    // South boundary. Set to point unless a x-line smoother already
+    //I j = 0;
+    for (I i = 1; i < n-2; i++) {
+        I ind = index_from_grid_inds(i, 0, n);
+        //if (smoother_ID[ind] != 1) smoother_ID[ind] = 0;
+        smoother_ID[ind] = 0;
+    }
+
+    // North boundary. Set to point unless a x-line smoother already
+    // I j = n-2;
+    for (I i = 1; i < n-2; i++) {
+        I ind = index_from_grid_inds(i, n-2, n);
+        //if (smoother_ID[ind] != 1) smoother_ID[ind] = 0;
+        smoother_ID[ind] = 0;
+    }
+}
+
+
+// start at some point. Find its immediate neighbours that its connected to
+
+// it can be the case that blocks get merged. think about the case where the first DOF is in a 1x1 block and then the DOF to its right is in an x-line block. 
+
+// suppose I loop through all DOFs and for each I identify the DOFs it needs to be connected to. This gives me a collection of (potentially) overlapping sets, and what I have to do is split into disjoint sets.
+
+// This is some kind of cover problem, I think. But I cannot work out which. Perhaps it's a flood fill algorithm, but I need my graph to be un-directed because I can the case where a node is unreachable in one direction but it is in the other. So I should build the adjacency graph and then symmetrize it? To do this I just add it to its transpose and subtract the identity (since every point is connected to itself so there are ones on the diag of the adjacency and we don't want to double up on these). Then I think this is something I can run a flood fill algorithm on.
+
+
+/* Build adjacency matrix for blocks in optimal smoothers
+*/
+template<class I, class T>
+void optimal_smoother_adjacency(const I smoother_ID[], const int smoother_ID_size,
+                                      I Sp[], const int Sp_size,
+                                      I Sj[], const int Sj_size)
+{
+    
+    I N = smoother_ID_size; // Total number of DOFs.
+    I n = sqrt(N) + 1; // N = (n-1)^2 for n-1 DOFs in each direction
+
+
+    // Build adjacency matrix
+    // In principle, each DOF can be directly connected to at most 3 DOFs including itself. This gives us an upper bound on allocating the NZ for the adjacency matrix. 
+    Sp[0] = 0;
+    I count = 0; // counter for the number of elements added to Sj
+    for (I dof = 0; dof < N; dof++) {
+        
+        // Grid indices of current dof
+        I j = dof / (n-1); // Note the integer division
+        I i = dof - j * (n-1);  
+
+        switch (smoother_ID[dof])
+        {
+        // point
+        case 0:
+            Sj[count] = dof;
+            count += 1;
+            break;
+
+        // x-line. W and E neighbors
+        case 1:
+            Sj[count]   = index_from_grid_inds(i-1, j, n);
+            Sj[count+1] = dof;
+            Sj[count+2] = index_from_grid_inds(i+1, j, n);
+            count += 3;
+            /* code */
+            break;
+
+        // 45-line. SW and NE neighbors
+        case 2:
+            Sj[count]   = index_from_grid_inds(i-1, j-1, n);
+            Sj[count+1] = dof;
+            Sj[count+2] = index_from_grid_inds(i+1, j+1, n);
+            count += 3;
+            break;
+
+        // y-line. S and N neighbors
+        case 3:
+            Sj[count]   = index_from_grid_inds(i, j-1, n);
+            Sj[count+1] = dof;
+            Sj[count+2] = index_from_grid_inds(i, j+1, n);
+            count += 3;
+            break;
+
+        // 135-line. SE and NW neighbors
+        case 4:
+            Sj[count]   = index_from_grid_inds(i+1, j-1, n);
+            Sj[count+1] = dof;
+            Sj[count+2] = index_from_grid_inds(i-1, j+1, n);
+            count += 3;
+            break;
+        
+        default:
+            std::cout << "error smoother_ID not recognised";
+            break;
+        }
+
+        Sp[dof+1] = count;
+    } 
+
+}
+
+
 
 // Get coarse-grid index for a point on both fine and coarse grids given its fine grid indices
 template<class I>

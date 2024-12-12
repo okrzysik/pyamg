@@ -1,6 +1,8 @@
 """amg_core - a C++ implementation of AMG-related routines."""
 
-from .adaptive_relaxation import (lsa_splitting,
+from .adaptive_relaxation import (optimal_smoother,
+                                optimal_smoother_adjacency,
+                                lsa_splitting,
                                 lsa_strength,
                                 block_gauss_seidel_gen_inv,
                                 block_gauss_seidel_gen_splu,
@@ -46,6 +48,8 @@ from .air import (one_point_interpolation, approx_ideal_restriction_pass1,
 
 __all__ = [
     # adaptive_relaxation
+    'optimal_smoother',
+    'optimal_smoother_adjacency',
     'lsa_splitting',
     'lsa_strength',
     'block_gauss_seidel_gen_inv',

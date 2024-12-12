@@ -43,6 +43,8 @@ instantiate:
     - [int,float]
     - [int,double]
   functions:
+    - optimal_smoother
+    - optimal_smoother_adjacency
     - lsa_strength
     - lsa_splitting
     - extract_and_invert_constant_subblocks
