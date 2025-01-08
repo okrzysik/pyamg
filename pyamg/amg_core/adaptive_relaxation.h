@@ -132,25 +132,127 @@ std::complex<T> nine_point_fourier_symbol(const T A[], const T omega1, const T o
     return A_tilde;
 }
 
-
-
-
-
-/* A is assumed ordered row-wise lexicographically with n-1 interior DOFs in either direction 
-
-At every point, A is assumed to have 9-point stencil
+/* Extract the 9-point stencil from the given CSR matrix A for the given DOF. A is assumed to apply to a grid with n-1 interior DOFs in each direction. 
+    Any DOF that doesn't have a full 9-point stencil just has those missing entries padded with zeros 
 */
 template<class I, class T>
-void optimal_smoother(const I Ap[], const int Ap_size, 
-                         const I Aj[], const int Aj_size,
-                         const T Ax[], const int Ax_size,
-                               I smoother_ID[], const int smoother_ID_size, // smoother ID's need to be pre-allocated
-                         const T modes[], const int modes_size) // Frequencies of modes to optimize over. Blocked in x and y pairs
+void get_9pt_stencil(const I Ap[], 
+                     const I Aj[],
+                     const T Ax[],
+                     const I dof,
+                     const I n,
+                           T A_stencil[]) 
+{
+    // Zero out all entries in the stencil
+    memset(A_stencil, 0.0, 9 * sizeof(A_stencil[0]));
+    
+    // Grid indices of current dof
+    I j = dof / (n-1); // Note the integer division
+    I i = dof - j * (n-1); 
+
+    // Get 9-point stencil for this DOF
+    // Loop over all columns connected to DOF
+    for (I col_idx = Ap[dof]; col_idx < Ap[dof+1]; col_idx++) {
+
+        // global index of connection
+        I col = Aj[col_idx];
+        T Aij = Ax[col_idx];
+
+        // Grid indices of connection
+        I j_col = col / (n-1);
+        I i_col = col - j_col * (n-1);
+
+        // if (dof == 0) {
+        //     std::cout << col << ", " << Aij << ", " << i_col << ", " << j_col << ", " << nine_point_stencil_index(i_col - i, j_col - j) << "\n"; 
+        // }
+
+        // Instert Aij into appropriate place based on grid index offsets
+        A_stencil[nine_point_stencil_index(i_col - i, j_col - j)] = Aij;
+    }
+}
+
+
+/* Compute the optimal smoother for a single stencil, optimizing it over the give modes. This is a helper function for "optimal_smoother" below. */
+template<class I, class T>
+I optimal_smoother_(const T A_stencil[],
+                          T M_stencil[], // This is to be populated; is just a place holder
+                    const T modes[], 
+                    const I num_modes) 
+{
+    I num_smoothers = 5; // point (==0), x (==1), 45 (==2), y (==3), 135 (==4)
+
+    // Test A on RHFM
+    std::complex<T> A_action[num_modes];
+    for (I mode = 0; mode < num_modes; mode++) {
+        A_action[mode] = nine_point_fourier_symbol(A_stencil, modes[2*mode], modes[2*mode+1]);
+    }
+
+    // Test each of the preconditioners on the RHFM
+    const std::complex<T> one(1.0,0.0); 
+    T MU[num_smoothers] = { 0.0 };
+    std::complex<T> M_action[num_modes];
+    for (I smoother = 0; smoother < num_smoothers; smoother++) {
+        nine_point_prec_stencil(M_stencil, smoother, A_stencil);
+
+        // Test M on RHFM
+        for (I mode = 0; mode < num_modes; mode++) {
+            M_action[mode] = nine_point_fourier_symbol(M_stencil, modes[2*mode], modes[2*mode+1]);
+        }
+
+        T S_max = 0.0;
+        // Compute approximate smoothing factor by maximizing action of smoother on RHFM
+        for (I mode = 0; mode < num_modes; mode++) {
+            T S_temp = std::abs( one - A_action[mode]/M_action[mode] );
+            if (S_temp > S_max) {S_max = S_temp;}
+        }
+
+        MU[smoother] = S_max;
+    }
+
+    // Find smoother with minimum approximate smoothing factor
+    I min_smoother = 0;
+    T mu_min = MU[0];
+    for (I smoother = 1; smoother < num_smoothers; smoother++) {
+        if (MU[smoother] < mu_min) {mu_min = MU[smoother]; min_smoother = smoother;}
+    }
+
+    return min_smoother;
+}
+
+
+/* For matrix A using a 9-point stencil on a 2D grid, compute approximately at every DOF what is 
+ *the optimal smoother over a set of predefined smoothers.
+
+A is assumed ordered row-wise lexicographically with n-1 interior DOFs in either direction 
+
+Parameters
+ * ----------
+ * Ap : array
+ *     CSR row pointer
+ * Aj : array
+ *     CSR index array
+ * Ax : array
+ *     CSR data array
+ * smoother_ID : array
+ *     Integer array holding the type of smoother for each DOF. This is what is populated in this   function. It needs to be pre-allocated with a size equal to the number of DOFs.
+ * modes : array
+ *      These are the frequencies of modes to optimize over. They are blocked in x and y pairs
+ * bndry_strat : int
+ *      ID for strategy to emply at boundary-adjacent points since these DOFs do not have a full 9-point stencil.
+
+ */
+template<class I, class T>
+void optimal_smoother(const I Ap[],          const int Ap_size, 
+                      const I Aj[],          const int Aj_size,
+                      const T Ax[],          const int Ax_size,
+                            I smoother_ID[], const int smoother_ID_size, 
+                      const T modes[],       const int modes_size,
+                            I bndry_strat) 
 {
 
     I num_modes = modes_size / 2;
 
-    I num_smoothers = 5; // point, x, 45, y, 135 
+    I num_smoothers = 5; // point (==0), x (==1), 45 (==2), y (==3), 135 (==4) 
 
     I N = Ap_size - 1; // Total number of DOFs.
     I n = sqrt(N) + 1; // N = (n-1)^2 for n-1 DOFs in each direction
@@ -160,201 +262,471 @@ void optimal_smoother(const I Ap[], const int Ap_size,
     // 9-point stencil for associated preconditioner
     T M_stencil[9];
 
+    // Loop over all DOFs
+    // For each DOF, test the corresponding preconditioned 9-point stencils against the given modes
+    // Any DOF that doesn't have a full 9-point stencil just has those missing entries padded with zeros 
     for (I dof = 0; dof < N; dof++) {
 
-        // Zero out all entries in the stencil
-        memset(A_stencil, 0.0, 9 * sizeof(A_stencil[0]));
-        
-        // Grid indices of current dof
-        I j = dof / (n-1); // Note the integer division
-        I i = dof - j * (n-1); 
+        // Get 9-point stencil for given DOF
+        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
 
-        // Get 9-point stencil for this DOF
-        // Loop over all columns connected to DOF
-        for (I col_idx = Ap[dof]; col_idx < Ap[dof+1]; col_idx++) {
+        // Compute the associated optimal smoother
+        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
 
-            // global index of connection
-            I col = Aj[col_idx];
-            T Aij = Ax[col_idx];
+    }
+    // Finished processing all DOFs
 
-            // Grid indices of connection
-            I j_col = col / (n-1);
-            I i_col = col - j_col * (n-1);
 
-            // if (dof == 0) {
-            //     std::cout << col << ", " << Aij << ", " << i_col << ", " << j_col << ", " << nine_point_stencil_index(i_col - i, j_col - j) << "\n"; 
-            // }
+    // Deal with boundary-adjacent DOFs
+    // --------------------------------
 
-            // Instert Aij into appropriate place based on grid index offsets
-            A_stencil[nine_point_stencil_index(i_col - i, j_col - j)] = Aij;
+    // Strategy 1 is what's implemented above, so don't do anything
+    if (bndry_strat == 1) {
+
+    // Strategy 0 forces point smoothers at all of these DOFs
+    } else if (bndry_strat == 0) {
+
+        // Corner points
+        smoother_ID[index_from_grid_inds(0,   0,   n)] = 0; // SW
+        smoother_ID[index_from_grid_inds(n-2, 0,   n)] = 0; // SE
+        smoother_ID[index_from_grid_inds(0,   n-2, n)] = 0; // NW
+        smoother_ID[index_from_grid_inds(n-2, n-2, n)] = 0; // NE
+
+        // West boundary. //I i = 0;
+        for (I j = 1; j < n-2; j++) {
+            I ind = index_from_grid_inds(0, j, n);
+            smoother_ID[ind] = 0;
+        }
+        // East boundary. //I i = n-2;
+        for (I j = 1; j < n-2; j++) {
+            I ind = index_from_grid_inds(n-2, j, n);
+            smoother_ID[ind] = 0;
+        }
+        // South boundary. //I j = 0;
+        for (I i = 1; i < n-2; i++) {
+            I ind = index_from_grid_inds(i, 0, n);
+            smoother_ID[ind] = 0;
+        }
+        // North boundary. // I j = n-2;
+        for (I i = 1; i < n-2; i++) {
+            I ind = index_from_grid_inds(i, n-2, n);
+            smoother_ID[ind] = 0;
         }
 
-        // if (dof == 0) {
-        //     for (int i = 0; i < 9; i++) std::cout << A_stencil[i] << ", ";
-        //     std::cout << "\n";
-        // }
+    // Strategy 2 re-computes the smoothers for boundary-adjacent DOFs assuming a symmetric stencil
+    } else if (bndry_strat == 2) {
 
-        // Test A on RHFM
-        std::complex<T> A_action[num_modes];
-        for (I mode = 0; mode < num_modes; mode++) {
-            A_action[mode] = nine_point_fourier_symbol(A_stencil, modes[2*mode], modes[2*mode+1]);
+        // A symmetric stencil is of the form
+        // NW N NE
+        // W  O W
+        // NE N NW
+
+        // Initialize to dummy values
+        I dof = -1;
+        T SW = -1.0, S = -1.0, SE = -1.0, W = -1.0, O = -1.0, E = -1.0, NW = -1.0, N = -1.0, NE = -1.0;
+
+        // -------------
+        // Corner points
+        // -------------
+
+        // ---------------------
+        // SW
+        // x  N  NE      NW N NE
+        // x  O  W   --> W  O  W
+        // x  x  x       NE N NW
+        dof = index_from_grid_inds(0, 0, n);
+        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+        // Extract known entries
+        O  = A_stencil[nine_point_stencil_index( 0, 0)]; 
+        W  = A_stencil[nine_point_stencil_index( 1, 0)]; 
+        N  = A_stencil[nine_point_stencil_index( 0, 1)]; 
+        NE = A_stencil[nine_point_stencil_index( 1, 1)]; 
+        // Compute missing stencil entry
+        NW = -(0.5*O + W + N + NE); 
+        // Insert missing entries into stencil of A
+        A_stencil[nine_point_stencil_index(-1,-1)] = NE;
+        A_stencil[nine_point_stencil_index( 0,-1)] = N;
+        A_stencil[nine_point_stencil_index( 1,-1)] = NW;
+        A_stencil[nine_point_stencil_index(-1, 0)] = W;
+        A_stencil[nine_point_stencil_index(-1, 1)] = NW;
+        // Get optimal smoother on updated stencil
+        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+
+        // ---------------------
+        // SE
+        // NW N  x      NW N NE
+        // W  O  x  --> W  O  W
+        // x  x  x      NE N NW
+        dof = index_from_grid_inds(n-2, 0, n);
+        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+        // Extract known entries
+        W  = A_stencil[nine_point_stencil_index(-1, 0)]; 
+        O  = A_stencil[nine_point_stencil_index( 0, 0)]; 
+        NW = A_stencil[nine_point_stencil_index(-1, 1)]; 
+        N  = A_stencil[nine_point_stencil_index( 0, 1)]; 
+        // Compute missing stencil entry
+        NE = -(W + 0.5*O + NW + N); 
+        // Insert missing entries into stencil of A
+        A_stencil[nine_point_stencil_index(-1,-1)] = NE;
+        A_stencil[nine_point_stencil_index( 0,-1)] = N;
+        A_stencil[nine_point_stencil_index( 1,-1)] = NW;
+        A_stencil[nine_point_stencil_index( 1, 0)] = W;
+        A_stencil[nine_point_stencil_index( 1, 1)] = NE;
+        // Get optimal smoother on updated stencil
+        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+
+        // ---------------------
+        // NW
+        // x  x  x       NW N NE
+        // x  O  W   --> W  O  W
+        // x  N  NW      NE N NW
+        dof = index_from_grid_inds(0, n-2, n);
+        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+        // Extract known entries
+        N  = A_stencil[nine_point_stencil_index( 0,-1)];
+        NW = A_stencil[nine_point_stencil_index( 1,-1)]; 
+        O  = A_stencil[nine_point_stencil_index( 0, 0)]; 
+        W  = A_stencil[nine_point_stencil_index( 1, 0)]; 
+        // Compute missing stencil entry
+        NE = -(N + NW + 0.5*O + W); 
+        // Insert missing entries into stencil of A
+        A_stencil[nine_point_stencil_index(-1,-1)] = NE;
+        A_stencil[nine_point_stencil_index(-1, 0)] = W;
+        A_stencil[nine_point_stencil_index(-1, 1)] = NW;
+        A_stencil[nine_point_stencil_index( 0, 1)] = N;
+        A_stencil[nine_point_stencil_index( 1, 1)] = NE;
+        // Get optimal smoother on updated stencil
+        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+
+        // --------------------
+        // NE
+        // x  x  x     NW N NE
+        // W  O  x --> W  O  W
+        // NE N  x     NE N NW
+        dof = index_from_grid_inds(n-2, n-2, n);
+        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+        // Extract known entries
+        NE = A_stencil[nine_point_stencil_index(-1,-1)];
+        N  = A_stencil[nine_point_stencil_index( 0,-1)]; 
+        W  = A_stencil[nine_point_stencil_index(-1, 0)]; 
+        O  = A_stencil[nine_point_stencil_index( 0, 0)]; 
+        // Compute missing stencil entry
+        NW = -(NE + N + W + 0.5*O); 
+        // Insert missing entries into stencil of A
+        A_stencil[nine_point_stencil_index( 1,-1)] = NW;
+        A_stencil[nine_point_stencil_index( 1, 0)] = W;
+        A_stencil[nine_point_stencil_index(-1, 1)] = NW;
+        A_stencil[nine_point_stencil_index( 0, 1)] = N;
+        A_stencil[nine_point_stencil_index( 1, 1)] = NE;
+        // Get optimal smoother on updated stencil
+        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+
+        // Non-corner points
+
+        // West boundary. //I i = 0;
+        // x N NE     NW N NE
+        // x O  W --> W  O  W
+        // x N NW     NE N NW
+        for (I j = 1; j < n-2; j++) {
+            dof = index_from_grid_inds(0, j, n);
+            get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+            // Extract known entries
+            NW = A_stencil[nine_point_stencil_index( 1,-1)];
+            W  = A_stencil[nine_point_stencil_index( 1, 0)];
+            NE = A_stencil[nine_point_stencil_index( 1, 1)];
+            // Insert missing entries into stencil of A
+            A_stencil[nine_point_stencil_index(-1,-1)] = NE;
+            A_stencil[nine_point_stencil_index(-1, 0)] = W; 
+            A_stencil[nine_point_stencil_index(-1, 1)] = NW;
+            // Get optimal smoother on updated stencil
+            smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
         }
-
-        // Test each of the preconditioners on the RHFM
-        const std::complex<T> one(1.0,0.0); 
-        T MU[num_smoothers] = { 0.0 };
-        std::complex<T> M_action[num_modes];
-        for (I smoother = 0; smoother < num_smoothers; smoother++) {
-            nine_point_prec_stencil(M_stencil, smoother, A_stencil);
-
-            // Test M on RHFM
-            for (I mode = 0; mode < num_modes; mode++) {
-                M_action[mode] = nine_point_fourier_symbol(M_stencil, modes[2*mode], modes[2*mode+1]);
-            }
-
-            T S_max = 0.0;
-            // Compute approximate smoothing factor by maximizing action of smoother on RHFM
-            for (I mode = 0; mode < num_modes; mode++) {
-                T S_temp = std::abs( one - A_action[mode]/M_action[mode] );
-                if (S_temp > S_max) {S_max = S_temp;}
-            }
-
-            MU[smoother] = S_max;
+        // East boundary. //I i = n-2;
+        // NW N  x     NW N NE
+        // W  O  x --> W  O  W
+        // NE N  x     NE S NW
+        for (I j = 1; j < n-2; j++) {
+            dof = index_from_grid_inds(n-2, j, n);
+            // Extract known entries
+            NE = A_stencil[nine_point_stencil_index(-1,-1)];
+            W  = A_stencil[nine_point_stencil_index(-1, 0)]; 
+            NW = A_stencil[nine_point_stencil_index(-1, 1)];
+            // Insert missing entries into stencil of A
+            A_stencil[nine_point_stencil_index( 1,-1)] = NW;
+            A_stencil[nine_point_stencil_index( 1, 0)] = W; 
+            A_stencil[nine_point_stencil_index( 1, 1)] = NE;
+            // Get optimal smoother on updated stencil
+            smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
         }
-
-        // Find smoother with minimum approximate smoothing factor
-        I min_smoother = 0;
-        T mu_min = MU[0];
-        for (I smoother = 1; smoother < num_smoothers; smoother++) {
-            if (MU[smoother] < mu_min) {mu_min = MU[smoother]; min_smoother = smoother;}
+        // South boundary. //I j = 0;
+        // NW N NE     NW N NE
+        // W  O  W --> W  O  W
+        // x  x  x     NE N NW
+        for (I i = 1; i < n-2; i++) {
+            dof = index_from_grid_inds(i, 0, n);
+            // Extract known entries
+            NW = A_stencil[nine_point_stencil_index(-1, 1)]; 
+            N  = A_stencil[nine_point_stencil_index( 0, 1)];
+            NE = A_stencil[nine_point_stencil_index( 1, 1)];
+            // Insert missing entries into stencil of A
+            A_stencil[nine_point_stencil_index(-1,-1)] = NE;
+            A_stencil[nine_point_stencil_index( 0,-1)] = N; 
+            A_stencil[nine_point_stencil_index( 1,-1)] = NW;
+            // Get optimal smoother on updated stencil
+            smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
         }
+        // North boundary. // I j = n-2;
+        // x  x  x     NW N NE
+        // W  O  W --> W  O  W
+        // NE N NW     NE N NW
+        for (I i = 1; i < n-2; i++) {
+            dof = index_from_grid_inds(i, n-2, n);
+            // Extract known entries
+            NE = A_stencil[nine_point_stencil_index(-1,-1)];
+            N  = A_stencil[nine_point_stencil_index( 0,-1)]; 
+            NW = A_stencil[nine_point_stencil_index( 1,-1)];
+            // Insert missing entries into stencil of A
+            A_stencil[nine_point_stencil_index(-1, 1)] = NW;
+            A_stencil[nine_point_stencil_index( 0, 1)] = N; 
+            A_stencil[nine_point_stencil_index( 1, 1)] = NE;
+            // Get optimal smoother on updated stencil
+            smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+        }
+    } 
+    // Finished dealing with boundary DOFs    
+}
 
-        // Store minimum smoother
-        smoother_ID[dof] = min_smoother;
 
-    } // finished processing current DOF
 
+/* For the given INTERIOR DOF, find its distance 1 neighbours (including itself) on the mesh based on the type of smoother it uses.
+ * Sj is an array in which the indicies of the connections are placed 
+ * count is the number of connections added
+ */
+template<class I>
+void smoother_dist1_con_interior(const I i,
+                                 const I j,
+                                 const I n,
+                                 const I dof,
+                                 const I smoother_ID,
+                                       I Sj[],
+                                       I &count)
+{
+    switch (smoother_ID)
+    {
+    // point
+    case 0:
+        Sj[0] = dof;
+        count = 1;
+        break;
+
+    // x-line. W and E neighbors
+    case 1:
+        Sj[0] = index_from_grid_inds(i-1, j, n);
+        Sj[1] = dof;
+        Sj[2] = index_from_grid_inds(i+1, j, n);
+        count = 3;
+        /* code */
+        break;
+
+    // 45-line. SW and NE neighbors
+    case 2:
+        Sj[0] = index_from_grid_inds(i-1, j-1, n);
+        Sj[1] = dof;
+        Sj[2] = index_from_grid_inds(i+1, j+1, n);
+        count = 3;
+        break;
+
+    // y-line. S and N neighbors
+    case 3:
+        Sj[0] = index_from_grid_inds(i, j-1, n);
+        Sj[1] = dof;
+        Sj[2] = index_from_grid_inds(i, j+1, n);
+        count = 3;
+        break;
+
+    // 135-line. SE and NW neighbors
+    case 4:
+        Sj[0] = index_from_grid_inds(i+1, j-1, n);
+        Sj[1] = dof;
+        Sj[2] = index_from_grid_inds(i-1, j+1, n);
+        count = 3;
+        break;
     
-    // If a boundary-adjacent point uses anything other than a line parallel to the boundary then force it to use a point smoother. Force all corners to be point smoothers. This simplifies the implementation below and shouldn't really mess anything up, I think...
-    smoother_ID[index_from_grid_inds(0,   0,   n)] = 0; // SW
-    smoother_ID[index_from_grid_inds(n-2, 0,   n)] = 0; // SE
-    smoother_ID[index_from_grid_inds(0,   n-2, n)] = 0; // NW
-    smoother_ID[index_from_grid_inds(n-2, n-2, n)] = 0; // NE
-
-    // West boundary. Set to point unless a y-line smoother already
-    //I i = 0;
-    for (I j = 1; j < n-2; j++) {
-        I ind = index_from_grid_inds(0, j, n);
-        //if (smoother_ID[ind] != 3) smoother_ID[ind] = 0;
-        smoother_ID[ind] = 0;
-    }
-
-    // East boundary. Set to point unless a y-line smoother already
-    //I i = n-2;
-    for (I j = 1; j < n-2; j++) {
-        I ind = index_from_grid_inds(n-2, j, n);
-        //if (smoother_ID[ind] != 3) smoother_ID[ind] = 0;
-        smoother_ID[ind] = 0;
-    }
-
-    // South boundary. Set to point unless a x-line smoother already
-    //I j = 0;
-    for (I i = 1; i < n-2; i++) {
-        I ind = index_from_grid_inds(i, 0, n);
-        //if (smoother_ID[ind] != 1) smoother_ID[ind] = 0;
-        smoother_ID[ind] = 0;
-    }
-
-    // North boundary. Set to point unless a x-line smoother already
-    // I j = n-2;
-    for (I i = 1; i < n-2; i++) {
-        I ind = index_from_grid_inds(i, n-2, n);
-        //if (smoother_ID[ind] != 1) smoother_ID[ind] = 0;
-        smoother_ID[ind] = 0;
+    default:
+        std::cout << "error smoother_ID not recognised";
+        break;
     }
 }
 
 
-// start at some point. Find its immediate neighbours that its connected to
+/* Almost identical to the above, except the DOF in question is adjacent to the boundary and so doesn't have a full set of distance-1 neighbors. As such, this function just employs some additonal checks that the distance-1 neighbors exist on the mesh before they are added into Sj (there's no point on doing all of these time-consuming checks for all of the interior DOF which have a full set of neighbors).
+ */
+template<class I>
+void smoother_dist1_con_bndry_adj(const I i,
+                                  const I j,
+                                  const I n,
+                                  const I dof,
+                                  const I smoother_ID,
+                                        I Sj[],
+                                        I &count)
+{
+    I count_loc = 0; // Counter for number of elements added for this DOF
+    switch (smoother_ID)
+    {
+    // point
+    case 0:
+        Sj[0] = dof;
+        count = 1;
+        break;
 
-// it can be the case that blocks get merged. think about the case where the first DOF is in a 1x1 block and then the DOF to its right is in an x-line block. 
+    // x-line. W and E neighbors. Ensure they exist.
+    case 1:
+        if (i != 0) { // West neighbor: I cannot be on the west boundary
+            Sj[count]  = index_from_grid_inds(i-1, j, n);
+            count_loc += 1;
+        }
+        Sj[count_loc]  = dof;
+        count_loc     += 1;
+        if (i != n-2) { // East neighbor: I cannot be on the east boundary
+            Sj[count_loc]  = index_from_grid_inds(i+1, j, n);
+            count_loc     += 1;
+        }
+        count = count_loc;
+        break;
 
-// suppose I loop through all DOFs and for each I identify the DOFs it needs to be connected to. This gives me a collection of (potentially) overlapping sets, and what I have to do is split into disjoint sets.
+    // 45-line. SW and NE neighbors. Ensure they exist.
+    case 2:
+        if (i != 0 && j != 0) { // SW neighbor: I cannot be on the west or south boundaries
+            Sj[0]      = index_from_grid_inds(i-1, j-1, n);
+            count_loc += 1;
+        }
+        Sj[count_loc]  = dof;
+        count_loc     += 1;
+        if (j != n-2 && i != n-2) { // NE neighbor: I cannot be on the north or east boundaries
+            Sj[count_loc]  = index_from_grid_inds(i+1, j+1, n);
+            count_loc     += 1;
+        }
+        count = count_loc;
+        break;
 
-// This is some kind of cover problem, I think. But I cannot work out which. Perhaps it's a flood fill algorithm, but I need my graph to be un-directed because I can the case where a node is unreachable in one direction but it is in the other. So I should build the adjacency graph and then symmetrize it? To do this I just add it to its transpose and subtract the identity (since every point is connected to itself so there are ones on the diag of the adjacency and we don't want to double up on these). Then I think this is something I can run a flood fill algorithm on.
+    // y-line. S and N neighbors. Ensure they exist.
+    case 3:
+        if (j != 0) { // S neighbor: I cannot be on the south boundary
+            Sj[0]      = index_from_grid_inds(i, j-1, n);
+            count_loc += 1;
+        }
+        Sj[count_loc]  = dof;
+        count_loc     += 1;
+        if (j != n-2) { // N neighbor: I cannot be on the north boundary
+            Sj[count_loc]  = index_from_grid_inds(i, j+1, n);
+            count_loc     += 1;
+        }
+        count = count_loc;
+        break;
 
+    // 135-line. SE and NW neighbors. Ensure they exist.
+    case 4:
+        // SE neighbor: I cannot be on the south or east boundaries
+        if (j != 0 && i != n-2) { 
+            Sj[0]      = index_from_grid_inds(i+1, j-1, n);
+            count_loc += 1;
+        }
+        Sj[count_loc]  = dof;
+        count_loc     += 1;
+        // NW neighbor: I cannot be on the north or west boundaries
+        if (j != n-2 && i != 0) { 
+            Sj[count_loc]  = index_from_grid_inds(i-1, j+1, n);
+            count_loc     += 1;
+        }
+        count = count_loc;
+        break;
+    
+    default:
+        std::cout << "error smoother_ID not recognised";
+        break;
+    }
+}
 
 /* Build adjacency matrix for blocks in optimal smoothers
-*/
+ * smoother_ID[] : An array holding the smoother type for every DOF
+ * Sp[] and Sj[] are the row pointer and column index array for the adjacency matrix we construct here.  
+ * To build row i of this adjacency matrix, we simpy look at the type of smoother used at that point to discern which of its distance-1 neighbors it connects to, and these connections go into the adjacency matrix. 
+ */
 template<class I, class T>
 void optimal_smoother_adjacency(const I smoother_ID[], const int smoother_ID_size,
-                                      I Sp[], const int Sp_size,
-                                      I Sj[], const int Sj_size)
+                                      I Sp[],          const int Sp_size,
+                                      I Sj[],          const int Sj_size)
 {
     
     I N = smoother_ID_size; // Total number of DOFs.
     I n = sqrt(N) + 1; // N = (n-1)^2 for n-1 DOFs in each direction
 
-
     // Build adjacency matrix
-    // In principle, each DOF can be directly connected to at most 3 DOFs including itself. This gives us an upper bound on allocating the NZ for the adjacency matrix. 
-    Sp[0] = 0;
-    I count = 0; // counter for the number of elements added to Sj
-    for (I dof = 0; dof < N; dof++) {
-        
-        // Grid indices of current dof
-        I j = dof / (n-1); // Note the integer division
-        I i = dof - j * (n-1);  
+    // Each DOF can be directly connected to at most 3 DOFs including itself. This gives us an upper bound on allocating the NZ for the adjacency matrix. 
+    Sp[0]   = 0;
+    I count = 0; // counter for the cumulative number of elements added to Sj
+    I count_loc; // counter for the number of elements added to Sj for the given DOF
+    I dof;       // The given dof
 
-        switch (smoother_ID[dof])
+    // Rather than looping from DOF = 0 up to DOF = N-1, we iterate through the DOFs based on the decomposition of the grid into boundary-adjacent and interior points. This saves a lot of checking whether a DOF is boundary-adjacent or not.
+
+    // DOFs along south boundary
+    {
+        I j = 0;
+        for (I i = 0; i < n-1; i++) {   
+            count_loc = 0;
+            dof = index_from_grid_inds(i, j, n);
+            smoother_dist1_con_bndry_adj(i, j, n, dof, smoother_ID[dof], &(Sj[count]), count_loc);
+            count += count_loc;
+            Sp[dof+1] = count;
+        }
+    }
+
+    // All DOFs between south and north boundaries
+    for (I j = 1; j < n-2; j++) {
+
+        // Single west boundary DOF
         {
-        // point
-        case 0:
-            Sj[count] = dof;
-            count += 1;
-            break;
-
-        // x-line. W and E neighbors
-        case 1:
-            Sj[count]   = index_from_grid_inds(i-1, j, n);
-            Sj[count+1] = dof;
-            Sj[count+2] = index_from_grid_inds(i+1, j, n);
-            count += 3;
-            /* code */
-            break;
-
-        // 45-line. SW and NE neighbors
-        case 2:
-            Sj[count]   = index_from_grid_inds(i-1, j-1, n);
-            Sj[count+1] = dof;
-            Sj[count+2] = index_from_grid_inds(i+1, j+1, n);
-            count += 3;
-            break;
-
-        // y-line. S and N neighbors
-        case 3:
-            Sj[count]   = index_from_grid_inds(i, j-1, n);
-            Sj[count+1] = dof;
-            Sj[count+2] = index_from_grid_inds(i, j+1, n);
-            count += 3;
-            break;
-
-        // 135-line. SE and NW neighbors
-        case 4:
-            Sj[count]   = index_from_grid_inds(i+1, j-1, n);
-            Sj[count+1] = dof;
-            Sj[count+2] = index_from_grid_inds(i-1, j+1, n);
-            count += 3;
-            break;
-        
-        default:
-            std::cout << "error smoother_ID not recognised";
-            break;
+            I i = 0;
+            count_loc = 0;
+            dof = index_from_grid_inds(i, j, n);
+            smoother_dist1_con_bndry_adj(i, j, n, dof, smoother_ID[dof], &(Sj[count]), count_loc);
+            count += count_loc;
+            Sp[dof+1] = count;
         }
 
-        Sp[dof+1] = count;
-    } 
+        // Interior DOFs
+        for (I i = 1; i < n-2; i++) {
+            count_loc = 0;
+            dof = index_from_grid_inds(i, j, n);
+            smoother_dist1_con_interior(i, j, n, dof, smoother_ID[dof], &(Sj[count]), count_loc);
+            count += count_loc;
+            Sp[dof+1] = count;
+        }
 
+        // Single east boundary DOF
+        {
+            I i = n-2;
+            count_loc = 0;
+            dof = index_from_grid_inds(i, j, n);
+            smoother_dist1_con_bndry_adj(i, j, n, dof, smoother_ID[dof], &(Sj[count]), count_loc);
+            count += count_loc;
+            Sp[dof+1] = count;
+        }
+
+    }
+
+    // DOFs along north boundary
+    {
+        I j = n-2;
+        for (I i = 0; i < n-1; i++) {
+            count_loc = 0;
+            dof = index_from_grid_inds(i, j, n);
+            smoother_dist1_con_bndry_adj(i, j, n, dof, smoother_ID[dof], &(Sj[count]), count_loc);
+            count += count_loc;
+            Sp[dof+1] = count;
+        }
+    }
 }
 
 

@@ -14,7 +14,8 @@ void _optimal_smoother(
       py::array_t<I> & Aj,
       py::array_t<T> & Ax,
 py::array_t<I> & smoother_ID,
-   py::array_t<T> & modes
+   py::array_t<T> & modes,
+            I bndry_strat
                        )
 {
     auto py_Ap = Ap.unchecked();
@@ -33,7 +34,8 @@ py::array_t<I> & smoother_ID,
                       _Aj, Aj.shape(0),
                       _Ax, Ax.shape(0),
              _smoother_ID, smoother_ID.shape(0),
-                   _modes, modes.shape(0)
+                   _modes, modes.shape(0),
+              bndry_strat
                                   );
 }
 
@@ -380,9 +382,9 @@ PYBIND11_MODULE(adaptive_relaxation, m) {
     options.disable_function_signatures();
 
     m.def("optimal_smoother", &_optimal_smoother<int, float>,
-        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("modes").noconvert());
+        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("modes").noconvert(), py::arg("bndry_strat"));
     m.def("optimal_smoother", &_optimal_smoother<int, double>,
-        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("modes").noconvert(),
+        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("modes").noconvert(), py::arg("bndry_strat"),
 R"pbdoc(
 )pbdoc");
 
@@ -391,7 +393,10 @@ R"pbdoc(
     m.def("optimal_smoother_adjacency", &_optimal_smoother_adjacency<int, double>,
         py::arg("smoother_ID").noconvert(), py::arg("Sp").noconvert(), py::arg("Sj").noconvert(),
 R"pbdoc(
-)pbdoc");
+Build adjacency matrix for blocks in optimal smoothers
+smoother_ID[] : An array holding the smoother type for every DOF
+Sp[] and Sj[] are the row pointer and column index array for the adjacency matrix we construct here.
+To build row i of this adjacency matrix, we simpy look at the type of smoother used at that point to discern which of its distance-1 neighbors it connects to, and these connections go into the adjacency matrix.)pbdoc");
 
     m.def("operator_dependent_interpolation", &_operator_dependent_interpolation<int, float>,
         py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("Pp").noconvert(), py::arg("Pj").noconvert(), py::arg("Px").noconvert(), py::arg("n"));
