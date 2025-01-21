@@ -15,7 +15,6 @@ inline I index_from_grid_inds(const I i, const I j, const I n) {
 }
 
 
-
 template<class I, class T>
 void nine_point_prec_stencil(T M_stencil[], const I smoother_ID, const T A_stencil[])
 {
@@ -136,12 +135,12 @@ std::complex<T> nine_point_fourier_symbol(const T A[], const T omega1, const T o
     Any DOF that doesn't have a full 9-point stencil just has those missing entries padded with zeros 
 */
 template<class I, class T>
-void get_9pt_stencil(const I Ap[], 
-                     const I Aj[],
-                     const T Ax[],
-                     const I dof,
-                     const I n,
-                           T A_stencil[]) 
+void nine_point_stencil_get(const I Ap[], 
+                            const I Aj[],
+                            const T Ax[],
+                            const I dof,
+                            const I n,
+                                T A_stencil[]) 
 {
     // Zero out all entries in the stencil
     memset(A_stencil, 0.0, 9 * sizeof(A_stencil[0]));
@@ -172,9 +171,26 @@ void get_9pt_stencil(const I Ap[],
 }
 
 
+template<class T>
+void nine_point_stencil_print(const T A_stencil[])
+{
+    std::cout << A_stencil[nine_point_stencil_index(-1, 1)] << " "; 
+    std::cout << A_stencil[nine_point_stencil_index( 0, 1)] << " "; 
+    std::cout << A_stencil[nine_point_stencil_index( 1, 1)] << " "; 
+    std::cout << "\n";
+    std::cout << A_stencil[nine_point_stencil_index(-1, 0)] << " "; 
+    std::cout << A_stencil[nine_point_stencil_index( 0, 0)] << " "; 
+    std::cout << A_stencil[nine_point_stencil_index( 1, 0)] << " "; 
+    std::cout << "\n"; 
+    std::cout << A_stencil[nine_point_stencil_index(-1,-1)] << " "; 
+    std::cout << A_stencil[nine_point_stencil_index( 0,-1)] << " "; 
+    std::cout << A_stencil[nine_point_stencil_index( 1,-1)] << " "; 
+    std::cout << "\n"; 
+}
+
 /* Compute the optimal smoother for a single stencil, optimizing it over the give modes. This is a helper function for "optimal_smoother" below. */
 template<class I, class T>
-I optimal_smoother_(const T A_stencil[],
+I optimal_smoother_local(const T A_stencil[],
                           T M_stencil[], // This is to be populated; is just a place holder
                     const T modes[], 
                     const I num_modes) 
@@ -268,10 +284,10 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
     for (I dof = 0; dof < N; dof++) {
 
         // Get 9-point stencil for given DOF
-        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+        nine_point_stencil_get(Ap, Aj, Ax, dof, n, A_stencil); 
 
         // Compute the associated optimal smoother
-        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+        smoother_ID[dof] = optimal_smoother_local(A_stencil, M_stencil, modes, num_modes);
 
     }
     // Finished processing all DOFs
@@ -335,7 +351,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         // x  O  W   --> W  O  W
         // x  x  x       NE N NW
         dof = index_from_grid_inds(0, 0, n);
-        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+        nine_point_stencil_get(Ap, Aj, Ax, dof, n, A_stencil); 
         // Extract known entries
         O  = A_stencil[nine_point_stencil_index( 0, 0)]; 
         W  = A_stencil[nine_point_stencil_index( 1, 0)]; 
@@ -350,7 +366,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         A_stencil[nine_point_stencil_index(-1, 0)] = W;
         A_stencil[nine_point_stencil_index(-1, 1)] = NW;
         // Get optimal smoother on updated stencil
-        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+        smoother_ID[dof] = optimal_smoother_local(A_stencil, M_stencil, modes, num_modes);
 
         // ---------------------
         // SE
@@ -358,7 +374,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         // W  O  x  --> W  O  W
         // x  x  x      NE N NW
         dof = index_from_grid_inds(n-2, 0, n);
-        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+        nine_point_stencil_get(Ap, Aj, Ax, dof, n, A_stencil); 
         // Extract known entries
         W  = A_stencil[nine_point_stencil_index(-1, 0)]; 
         O  = A_stencil[nine_point_stencil_index( 0, 0)]; 
@@ -373,7 +389,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         A_stencil[nine_point_stencil_index( 1, 0)] = W;
         A_stencil[nine_point_stencil_index( 1, 1)] = NE;
         // Get optimal smoother on updated stencil
-        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+        smoother_ID[dof] = optimal_smoother_local(A_stencil, M_stencil, modes, num_modes);
 
         // ---------------------
         // NW
@@ -381,7 +397,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         // x  O  W   --> W  O  W
         // x  N  NW      NE N NW
         dof = index_from_grid_inds(0, n-2, n);
-        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+        nine_point_stencil_get(Ap, Aj, Ax, dof, n, A_stencil); 
         // Extract known entries
         N  = A_stencil[nine_point_stencil_index( 0,-1)];
         NW = A_stencil[nine_point_stencil_index( 1,-1)]; 
@@ -396,7 +412,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         A_stencil[nine_point_stencil_index( 0, 1)] = N;
         A_stencil[nine_point_stencil_index( 1, 1)] = NE;
         // Get optimal smoother on updated stencil
-        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+        smoother_ID[dof] = optimal_smoother_local(A_stencil, M_stencil, modes, num_modes);
 
         // --------------------
         // NE
@@ -404,7 +420,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         // W  O  x --> W  O  W
         // NE N  x     NE N NW
         dof = index_from_grid_inds(n-2, n-2, n);
-        get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+        nine_point_stencil_get(Ap, Aj, Ax, dof, n, A_stencil); 
         // Extract known entries
         NE = A_stencil[nine_point_stencil_index(-1,-1)];
         N  = A_stencil[nine_point_stencil_index( 0,-1)]; 
@@ -419,7 +435,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         A_stencil[nine_point_stencil_index( 0, 1)] = N;
         A_stencil[nine_point_stencil_index( 1, 1)] = NE;
         // Get optimal smoother on updated stencil
-        smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+        smoother_ID[dof] = optimal_smoother_local(A_stencil, M_stencil, modes, num_modes);
 
         // Non-corner points
 
@@ -429,7 +445,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         // x N NW     NE N NW
         for (I j = 1; j < n-2; j++) {
             dof = index_from_grid_inds(0, j, n);
-            get_9pt_stencil(Ap, Aj, Ax, dof, n, A_stencil); 
+            nine_point_stencil_get(Ap, Aj, Ax, dof, n, A_stencil); 
             // Extract known entries
             NW = A_stencil[nine_point_stencil_index( 1,-1)];
             W  = A_stencil[nine_point_stencil_index( 1, 0)];
@@ -439,7 +455,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
             A_stencil[nine_point_stencil_index(-1, 0)] = W; 
             A_stencil[nine_point_stencil_index(-1, 1)] = NW;
             // Get optimal smoother on updated stencil
-            smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+            smoother_ID[dof] = optimal_smoother_local(A_stencil, M_stencil, modes, num_modes);
         }
         // East boundary. //I i = n-2;
         // NW N  x     NW N NE
@@ -447,6 +463,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         // NE N  x     NE S NW
         for (I j = 1; j < n-2; j++) {
             dof = index_from_grid_inds(n-2, j, n);
+            nine_point_stencil_get(Ap, Aj, Ax, dof, n, A_stencil);
             // Extract known entries
             NE = A_stencil[nine_point_stencil_index(-1,-1)];
             W  = A_stencil[nine_point_stencil_index(-1, 0)]; 
@@ -456,7 +473,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
             A_stencil[nine_point_stencil_index( 1, 0)] = W; 
             A_stencil[nine_point_stencil_index( 1, 1)] = NE;
             // Get optimal smoother on updated stencil
-            smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+            smoother_ID[dof] = optimal_smoother_local(A_stencil, M_stencil, modes, num_modes);
         }
         // South boundary. //I j = 0;
         // NW N NE     NW N NE
@@ -464,6 +481,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         // x  x  x     NE N NW
         for (I i = 1; i < n-2; i++) {
             dof = index_from_grid_inds(i, 0, n);
+            nine_point_stencil_get(Ap, Aj, Ax, dof, n, A_stencil);
             // Extract known entries
             NW = A_stencil[nine_point_stencil_index(-1, 1)]; 
             N  = A_stencil[nine_point_stencil_index( 0, 1)];
@@ -473,7 +491,11 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
             A_stencil[nine_point_stencil_index( 0,-1)] = N; 
             A_stencil[nine_point_stencil_index( 1,-1)] = NW;
             // Get optimal smoother on updated stencil
-            smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+            smoother_ID[dof] = optimal_smoother_local(A_stencil, M_stencil, modes, num_modes);
+
+            // std::cout << "south boundary i = " << i << "\n";
+            // nine_point_stencil_print(A_stencil);
+            // std::cout << "\n";
         }
         // North boundary. // I j = n-2;
         // x  x  x     NW N NE
@@ -481,6 +503,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
         // NE N NW     NE N NW
         for (I i = 1; i < n-2; i++) {
             dof = index_from_grid_inds(i, n-2, n);
+            nine_point_stencil_get(Ap, Aj, Ax, dof, n, A_stencil);
             // Extract known entries
             NE = A_stencil[nine_point_stencil_index(-1,-1)];
             N  = A_stencil[nine_point_stencil_index( 0,-1)]; 
@@ -490,7 +513,7 @@ void optimal_smoother(const I Ap[],          const int Ap_size,
             A_stencil[nine_point_stencil_index( 0, 1)] = N; 
             A_stencil[nine_point_stencil_index( 1, 1)] = NE;
             // Get optimal smoother on updated stencil
-            smoother_ID[dof] = optimal_smoother_(A_stencil, M_stencil, modes, num_modes);
+            smoother_ID[dof] = optimal_smoother_local(A_stencil, M_stencil, modes, num_modes);
         }
     } 
     // Finished dealing with boundary DOFs    
