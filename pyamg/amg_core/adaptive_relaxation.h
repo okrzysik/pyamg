@@ -813,8 +813,17 @@ inline I cornering_coarse_neighbour_of_fine_point(const I i_f, const I j_f, cons
 
 
 // Compute y = P*x. Note that this is not optimal storage wise, but who cares.
+// P is a list of ints such that x[i] -> x[p[i]]
 template<class I, class T>
-inline void permute_vector(T y[], const I p[], const T x[], const int y_size) {
+inline void row_permute_vector(T y[], const I p[], const T x[], const int y_size) {
+    for (I i = 0; i < y_size; i++) {
+        y[p[i]] = x[i];
+    }
+}
+
+// P is a list of ints such that x[p[i]] -> x[i]
+template<class I, class T>
+inline void col_permute_vector(T y[], const I p[], const T x[], const int y_size) {
     for (I i = 0; i < y_size; i++) {
         y[i] = x[p[i]];
     }
@@ -1466,6 +1475,14 @@ void block_gauss_seidel_gen_inv(const I Ap[], const int Ap_size,
             }
         }
 
+        // The exact solution should be a fixed-point of this inversion, so uncomment this block and the one below to check this is the case.
+        // // Print block to be updated.
+        // std::cout << "pre-update block " << block << ": ";
+        // for (I count = 0; count < block_size; count++) {
+        //    std::cout << x[count + row_start] << ", ";
+        // }
+        // std::cout << "\n";
+
         // Now invert diagonal block. Basic error check
         if (Mp[block+1] - Mp[block] != block_size * block_size) {
             std::cerr << "Error: diagonal block size is inconsistent.\n";
@@ -1478,6 +1495,13 @@ void block_gauss_seidel_gen_inv(const I Ap[], const int Ap_size,
 
         // Done with r_local (next block is potentially different size)
         delete[] r_local;
+
+        // // Print block that has been updated.
+        // std::cout << "pst-update block " << block << ": ";
+        // for (I count = 0; count < block_size; count++) {
+        //    std::cout << x[count + row_start] << ", ";
+        // }
+        // std::cout << "\n";
     }
 }
 
@@ -1552,38 +1576,71 @@ void block_gauss_seidel_gen_splu(const I Ap[], const int Ap_size,
             }
         }
 
+
+        // The exact solution should be a fixed-point of this inversion, so uncomment this block and the one below to check this is the case.
+        // // Print block to be updated.
+        // std::cout << "pre-update block " << block << ": ";
+        // for (I count = 0; count < block_size; count++) {
+        //    std::cout << x[count + row_start] << ", ";
+        // }
+        // std::cout << "\n";
+        
         // Now invert diagonal block using SPLU 
         // Row data for current block in Xp, starts at index Xpp[block], and ends at one less than Xpp[block+1]
         // Column and non-zero data for current block in Xj and Xx starts at index Xpj[block], and ends at one less than Xpp[block+1]
         I Lp_start = Lpp[block];
-        I Lp_stop  = Lpp[block+1]-1; 
+        I Lp_stop  = Lpp[block+1]; 
         I Lp_block_size = Lp_stop - Lp_start; // Number of rows in current block
         I Lj_start = Lpj[block];
-        I Lj_stop  = Lpj[block+1]-1;
+        I Lj_stop  = Lpj[block+1];
         I Lj_block_size = Lj_stop - Lj_start; // nnz in current block
 
         I Up_start = Upp[block];
-        I Up_stop  = Upp[block+1]-1;
+        I Up_stop  = Upp[block+1];
         I Up_block_size = Up_stop - Up_start; // Number of rows in current block
         I Uj_start = Upj[block];
-        I Uj_stop  = Upj[block+1]-1;
+        I Uj_stop  = Upj[block+1];
         I Uj_block_size = Uj_stop - Uj_start; // nnz in current block
 
+        /* See docs for scipy.sparse.linalg.SuperLU for how exactly the sparse-aware LU of A is done. I'm confused about the implementation of Pr and Pc. They are stored as lists, but the lists are interpreted differently in each case. This is why I have separate row_permute_vector and a col_permute_vector functions. */
         /* Solve A_local * x_local = r_local == A*x = b
          * Have: Pr @ A @ Pc = L @ U and A @ x = b
          *
          * Hence Pr.T @ L @ U @ Pc.T @ x = b
          * Hence        L @ U        @ y = f, with y := Pc.T @ x, and f =: Pr @ b
-         * Hence        L            @ z = f, with z = U @ y
+         * Hence        L            @ z = f, with z := U @ y
          * Hence                       z = L^{-1} @ f
          * Hence            U        @ y = z, 
          * Hence                       y = U^{-1} @ z
          * Hence                       x = Pc @ y
          */ 
 
+        // if (block == 3) {
+        //     std::cout << "Pr = ";
+        //     for (I count = 0; count < block_size; count++) {
+        //         std::cout <<  Pr[row_start + count] << " ,";
+        //     }
+        //     std::cout << "\nPc = ";
+        //     for (I count = 0; count < block_size; count++) {
+        //         std::cout <<  Pc[row_start + count] << " ,";
+        //     }
+        //     std::cout << "\nLp = ";
+        //     for (I count = 0; count < Lp_block_size; count++) {
+        //         std::cout <<  Lp[Lp_start + count] << " ,";
+        //     }
+        //     std::cout << "\nLj = ";
+        //     for (I count = 0; count < Lj_block_size; count++) {
+        //         std::cout <<  Lj[Lj_start + count] << " ,";
+        //     }
+        //     std::cout << "\nLx = ";
+        //     for (I count = 0; count < Lj_block_size; count++) {
+        //         std::cout <<  Lx[Lj_start + count] << " ,";
+        //     }
+        // }
+
         // Compute f = Pr * b
         // Use f == aux and b == r_local 
-        permute_vector<I, T>(aux, &Pr[row_start], r_local, block_size);
+        row_permute_vector<I, T>(aux, &Pr[row_start], r_local, block_size);
         // Don't need r_local any longer
 
         // Solve for z s.t. L * z = f with a forward sweep of GS on L
@@ -1607,12 +1664,20 @@ void block_gauss_seidel_gen_splu(const I Ap[], const int Ap_size,
         // Don't need r_local any longer
 
         // Compute x = Pc * y, with y == aux
-        permute_vector<I, T>(&x[row_start], &Pc[row_start], aux, block_size);
+        col_permute_vector<I, T>(&x[row_start], &Pc[row_start], aux, block_size);
         // Don't need aux any longer
 
         // Done with r_local (next block is potentially different size)
         delete[] r_local;
         delete[] aux;
+
+
+        // // Print block that has been updated.
+        // std::cout << "pst-update block " << block << ": ";
+        // for (I count = 0; count < block_size; count++) {
+        //    std::cout << x[count + row_start] << ", ";
+        // }
+        // std::cout << "\n";
     }
 }
 
