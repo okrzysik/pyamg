@@ -16,7 +16,8 @@ void _optimal_smoother(
 py::array_t<I> & smoother_ID,
 py::array_t<T> & smoothing_factor,
    py::array_t<T> & modes,
-            I bndry_strat
+            I bndry_strat,
+           T point_thresh
                        )
 {
     auto py_Ap = Ap.unchecked();
@@ -39,7 +40,8 @@ py::array_t<T> & smoothing_factor,
              _smoother_ID, smoother_ID.shape(0),
         _smoothing_factor, smoothing_factor.shape(0),
                    _modes, modes.shape(0),
-              bndry_strat
+              bndry_strat,
+             point_thresh
                                   );
 }
 
@@ -386,9 +388,9 @@ PYBIND11_MODULE(adaptive_relaxation, m) {
     options.disable_function_signatures();
 
     m.def("optimal_smoother", &_optimal_smoother<int, float>,
-        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("smoothing_factor").noconvert(), py::arg("modes").noconvert(), py::arg("bndry_strat"));
+        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("smoothing_factor").noconvert(), py::arg("modes").noconvert(), py::arg("bndry_strat"), py::arg("point_thresh"));
     m.def("optimal_smoother", &_optimal_smoother<int, double>,
-        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("smoothing_factor").noconvert(), py::arg("modes").noconvert(), py::arg("bndry_strat"),
+        py::arg("Ap").noconvert(), py::arg("Aj").noconvert(), py::arg("Ax").noconvert(), py::arg("smoother_ID").noconvert(), py::arg("smoothing_factor").noconvert(), py::arg("modes").noconvert(), py::arg("bndry_strat"), py::arg("point_thresh"),
 R"pbdoc(
 )pbdoc");
 
