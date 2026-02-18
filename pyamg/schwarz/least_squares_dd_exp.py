@@ -290,6 +290,418 @@ def least_squares_dd_solver_exp(B, BT=None, A=None,
 
     return ml
 
+def _lsdd_process_one_aggregate_gep(
+    *,
+    i: int,
+    level,
+    nev: int | None,
+    min_coarsening,
+    counter: int,
+    p_r: list,
+    p_c: list,
+    p_v: list,
+) -> int:
+    """Process one aggregate's local generalized EVP and append selected vectors to P triplets.
+
+    This is a refactor-only extraction of the existing in-loop logic.
+
+    Parameters
+    ----------
+    i
+        Aggregate index.
+    level
+        The current multigrid level object (typically `levels[-1]`).
+    nev
+        If not None, keep exactly the largest `nev` eigenpairs (subject to min_coarsening).
+    min_coarsening
+        Per-level minimum coarsening ratio (assumed scalar at this call site).
+    counter
+        Current coarse column counter (used to build P triplets).
+    p_r, p_c, p_v
+        Lists of row indices, col indices, and values used to assemble P after the loop.
+        These lists are mutated in-place.
+
+    Returns
+    -------
+    int
+        Updated `counter`.
+    """
+    # Separate overlapping and nonoverlapping local DOFs (indices *within* Omega_i ordering)
+    nonoverlap = np.where(level.PoU[i] == 1)[0]
+    overlap = np.where(level.PoU[i] == 0)[0]
+
+    # Extract flattened local blocks (both are blocksize^2 vectors)
+    p0 = level.submatrices_ptr[i]
+    p1 = level.submatrices_ptr[i + 1]
+    b_flat = level.auxiliary[p0:p1]
+    a_flat = level.submatrices[p0:p1]
+
+    bsz = int(np.sqrt(len(b_flat)))
+    bb = np.reshape(b_flat, (bsz, bsz))
+
+    asz = int(np.sqrt(len(a_flat)))
+    aa = np.reshape(a_flat, (asz, asz))
+
+    # Regularization (as in original code)
+    normbb = np.linalg.norm(bb, ord=2)
+    bb = bb + np.eye(bb.shape[0]) * (1e-10 * normbb)
+
+    # Enforce minimum coarsening ratio on per-aggregate basis
+    max_ev = aa.shape[0]
+    this_nev = nev
+    if min_coarsening is not None:
+        max_ev = len(level.nonoverlapping_subdomain[i]) // min_coarsening
+    if nev is not None and min_coarsening is not None:
+        this_nev = np.min([nev, max_ev])
+
+    # Local principal submatrix restricted to nonoverlapping aggregate
+    aa = aa[nonoverlap, :][:, nonoverlap]
+
+    # Schur complement of outer product in nonoverlapping subdomain
+    S = (
+        bb[nonoverlap, :][:, nonoverlap]
+        - bb[nonoverlap, :][:, overlap]
+        @ np.linalg.inv(bb[overlap, :][:, overlap])
+        @ bb[overlap, :][:, nonoverlap]
+    )
+
+    # When possible only compute necessary eigenvalues/vectors
+    if max_ev <= 0:
+        # Nothing to keep; leave level.nev[i] as-is (initialized to 0)
+        return counter
+
+    try:
+        if max_ev != S.shape[0] and max_ev > 0:
+            E, V = eigh(aa, S, subset_by_index=[S.shape[0] - max_ev, S.shape[0] - 1])
+        elif max_ev > 0:
+            E, V = eigh(aa, S)
+    except Exception:
+        import pdb
+
+        pdb.set_trace()
+
+    # Precompute the fine rows associated with ω_i (in global indexing)
+    temp_inds = np.arange(level.subdomain_ptr[i], level.subdomain_ptr[i + 1])[nonoverlap]
+    temp_rows = level.subdomain[temp_inds]
+
+    if this_nev is not None and this_nev > 0:
+        # NOTE: assumes eigenvalues in increasing order
+        E = E[-this_nev:]
+        level.min_ev = min(level.min_ev, E[-this_nev])
+        V = V[:, -this_nev:]
+        level.nev[i] = this_nev
+
+        for j in range(len(E)):
+            p_r.append(temp_rows)
+            p_c.append([counter] * len(temp_rows))
+            p_v.append(V[:, j])
+            counter += 1
+
+    elif max_ev > 0:
+        counter_nev = 0
+        # NOTE: assumes eigenvalues in increasing order
+        for j in range(len(E) - 1, len(E) - np.min([len(E), max_ev]) - 1, -1):
+            if E[j] > level.threshold:
+                counter_nev += 1
+                level.min_ev = min(level.min_ev, E[j])
+                p_r.append(temp_rows)
+                p_c.append([counter] * len(temp_rows))
+                p_v.append(V[:, j])
+                counter += 1
+        level.nev[i] = counter_nev
+
+    return counter
+
+
+def _lsdd_build_overlap_and_pou(
+    *,
+    level,
+    A,
+    B,
+    BT,
+    v_mult,
+    v_row_mult,
+    blocksize,
+    print_info: bool,
+):
+    """Build overlapping subdomains, overlap-row sets, and PoU masks.
+
+    Refactor-only extraction of the existing code inside the "overlap" timing block.
+
+    Fills/updates on `level`:
+      - nonoverlapping_subdomain[i]
+      - overlapping_subdomain[i]
+      - overlapping_rows[i]
+      - PoU[i]
+      - nodes_vs_subdomains, T, number_of_colors, multiplicity
+      - nIi[i], ni[i]
+
+    Mutates the provided arrays:
+      - v_mult (node multiplicity over overlaps)
+      - v_row_mult (row multiplicity for BT-row sets)
+      - blocksize (|Omega_i|)
+    """
+    nodes_vs_subdomains_r = []
+    nodes_vs_subdomains_c = []
+    nodes_vs_subdomains_v = []
+
+    for i in range(level.N):
+        # List of aggregate indices for nonoverlapping subdomains
+        level.nonoverlapping_subdomain[i] = np.asarray(
+            level.AggOpT.indices[level.AggOpT.indptr[i] : level.AggOpT.indptr[i + 1]],
+            dtype=np.int32,
+        )
+        level.nIi[i] = len(level.nonoverlapping_subdomain[i])
+        level.overlapping_subdomain[i] = []
+
+        # Form overlapping subdomains as all fine-grid neighbors of each coarse aggregate
+        for j in level.nonoverlapping_subdomain[i]:
+            level.overlapping_subdomain[i].append(A.indices[A.indptr[j] : A.indptr[j + 1]])
+
+        level.overlapping_subdomain[i] = np.concatenate(level.overlapping_subdomain[i], dtype=np.int32)
+        level.overlapping_subdomain[i] = np.unique(level.overlapping_subdomain[i])
+        level.ni[i] = len(level.overlapping_subdomain[i])
+
+        # Get the overlapping rows
+        level.overlapping_rows[i] = []
+        for j in level.nonoverlapping_subdomain[i]:
+            level.overlapping_rows[i].append(BT.indices[BT.indptr[j] : BT.indptr[j + 1]])
+
+        level.overlapping_rows[i] = np.concatenate(level.overlapping_rows[i], dtype=np.int32)
+        level.overlapping_rows[i] = np.unique(level.overlapping_rows[i])
+        v_row_mult[level.overlapping_rows[i]] += 1
+
+        blocksize[i] = len(level.overlapping_subdomain[i])
+
+        # Loop over the subdomain and get the PoU (here PoU is a 0/1 mask: 1 on ω, 0 on Γ)
+        v_mult[level.overlapping_subdomain[i]] += 1
+        nodes_vs_subdomains_r.append(level.overlapping_subdomain[i])
+        nodes_vs_subdomains_c.append(i * np.ones(len(level.overlapping_subdomain[i]), dtype=np.int32))
+        nodes_vs_subdomains_v.append(np.ones(len(level.overlapping_subdomain[i])))
+
+    nodes_vs_subdomains_r = np.concatenate(nodes_vs_subdomains_r, dtype=np.int32)
+    nodes_vs_subdomains_c = np.concatenate(nodes_vs_subdomains_c, dtype=np.int32)
+    nodes_vs_subdomains_v = np.concatenate(nodes_vs_subdomains_v, dtype=np.float64)
+
+    level.nodes_vs_subdomains = csr_array(
+        (nodes_vs_subdomains_v, (nodes_vs_subdomains_r, nodes_vs_subdomains_c)),
+        shape=(A.shape[0], level.N),
+    )
+    level.T = level.nodes_vs_subdomains.T @ level.nodes_vs_subdomains
+    level.T.data[:] = 1
+    k_c = level.T @ np.ones(level.T.shape[0], dtype=level.T.data.dtype)
+    level.number_of_colors = max(k_c)
+    level.multiplicity = max(v_row_mult)
+
+    if print_info:
+        print("\tMean blocksize = {:.4g}".format(np.mean(blocksize)))
+        print("\tMax blocksize = {:.4g}".format(np.max(blocksize)))
+
+    # Form partition of unity vector separating overlapping and nonoverlapping domains.
+    for i in range(level.N):
+        level.PoU[i] = []
+        for j in level.overlapping_subdomain[i]:
+            if j in level.nonoverlapping_subdomain[i]:
+                level.PoU[i].append(1)
+            else:
+                level.PoU[i].append(0.0)
+        level.PoU[i] = np.array(level.PoU[i])
+
+    # Sanity check PoU correct (should reproduce any vector exactly)
+    temp = np.random.rand(A.shape[0])
+    temp2 = 0 * temp
+    for i in range(level.N):
+        temp2[level.overlapping_subdomain[i]] += level.PoU[i] * temp[level.overlapping_subdomain[i]]
+    if np.linalg.norm(temp2 - temp) > 1e-14 * np.linalg.norm(temp):
+        warn(
+            "Partition of unity is incorrect. This can happen if the partitioning strategy "
+            "did not yield a nonoverlapping cover of the set of nodes"
+        )
+
+
+def _lsdd_extract_local_principal_submatrices(*, level, A, blocksize):
+    """Extract local principal submatrices A(Omega_i, Omega_i) for all aggregates i.
+
+    Refactor-only extraction of the existing "extract_A" block.
+
+    Parameters
+    ----------
+    level
+        The current level object (typically levels[-1]).
+    A
+        Global operator on this level.
+    blocksize
+        Array of length level.N with blocksize[i] = |Omega_i|.
+
+    Side effects (sets on `level`)
+    ------------------------------
+    subdomain, subdomain_ptr
+        Flattened Omega_i indices and pointers (CSR-style).
+    submatrices_ptr
+        Pointers into flattened storage for each dense block (BSR-style).
+    submatrices
+        Flattened storage of all dense A(Omega_i,Omega_i) blocks.
+    auxiliary
+        Flattened storage for all dense splitting blocks (filled later).
+    """
+    # Form sparse indptr and indices for principal submatrices over subdomains
+    level.subdomain = np.zeros(np.sum(blocksize), dtype=np.int32)
+    level.subdomain_ptr = np.zeros(level.N + 1, dtype=np.int32)
+    level.subdomain_ptr[0] = 0
+
+    for i in range(level.N):
+        level.subdomain_ptr[i + 1] = level.subdomain_ptr[i] + blocksize[i]
+        level.subdomain[level.subdomain_ptr[i] : level.subdomain_ptr[i + 1]] = level.overlapping_subdomain[i]
+
+    # BSR-like indexing: each i has a blocksize[i] x blocksize[i] dense block
+    level.submatrices_ptr = np.zeros(level.N + 1, dtype=np.int32)
+    level.submatrices_ptr[0] = 0
+    for i in range(level.N):
+        level.submatrices_ptr[i + 1] = level.submatrices_ptr[i] + blocksize[i] * blocksize[i]
+
+    # Extract submatrices from overlapping subdomains
+    level.submatrices = np.zeros(level.submatrices_ptr[-1], dtype=A.data.dtype)
+    amg_core.extract_subblocks(
+        A.indptr,
+        A.indices,
+        A.data,
+        level.submatrices,
+        level.submatrices_ptr,
+        level.subdomain,
+        level.subdomain_ptr,
+        int(level.subdomain_ptr.shape[0] - 1),
+        A.shape[0],
+    )
+
+    # Allocate auxiliary storage for local outer products (filled later)
+    level.auxiliary = np.zeros(level.submatrices_ptr[-1])
+
+
+def _lsdd_local_outer_products_and_gep_init(
+    *,
+    level,
+    B,
+    BT,
+    v_row_mult,
+    kappa,
+    threshold,
+):
+    """Compute local outer products (splitting blocks) and initialize GEP/P assembly accumulators.
+
+    Refactor-only extraction of the existing "outerprod" block content that:
+      - calls amg_core.local_outer_product to fill `level.auxiliary`
+      - sets `level.threshold`
+      - initializes (p_r, p_c, p_v, counter) and `level.min_ev`
+
+    Returns
+    -------
+    p_r, p_c, p_v : lists
+        Triplet lists for assembling P after the per-aggregate loop.
+    counter : int
+        Starting coarse column counter (0).
+    """
+    # amg_core C++ implementation of extracting local subdomain outerproducts
+    BTT = BT.T.conjugate().tocsr()
+
+    rows_indptr = np.zeros(level.N + 1, dtype=np.int32)
+    cols_indptr = np.zeros(level.N + 1, dtype=np.int32)
+    for i in range(level.N):
+        rows_indptr[i + 1] = rows_indptr[i] + len(level.overlapping_rows[i])
+        cols_indptr[i + 1] = cols_indptr[i] + len(level.overlapping_subdomain[i])
+
+    rows_flat = np.concatenate(level.overlapping_rows).astype(np.int32, copy=False)
+    cols_flat = np.concatenate(level.overlapping_subdomain).astype(np.int32, copy=False)
+
+    amg_core.local_outer_product(
+        B.shape[0],
+        B.shape[1],
+        B.indptr,
+        B.indices,
+        B.data,
+        BTT.indptr,
+        BTT.indices,
+        BTT.data,
+        v_row_mult,
+        rows_flat,
+        rows_indptr,
+        cols_flat,
+        cols_indptr,
+        level.auxiliary,
+        level.submatrices_ptr,
+    )
+
+    if threshold is None:
+        level.threshold = max(0.1, ((kappa / level.number_of_colors) - 1) / level.multiplicity)
+    else:
+        level.threshold = threshold
+
+    p_r = []
+    p_c = []
+    p_v = []
+    counter = 0
+    level.min_ev = 1e12
+
+    return p_r, p_c, p_v, counter
+
+
+def _lsdd_assemble_P_from_triplets(*, level, n_fine: int, p_r, p_c, p_v, counter: int) -> int:
+    """Assemble prolongation P (and restriction R = P^H) from accumulated triplets.
+
+    Refactor-only extraction of the existing "assemble_P" block.
+
+    Parameters
+    ----------
+    level
+        Current level object (typically levels[-1]); sets level.P and level.R.
+    n_fine
+        Fine dimension (A.shape[0]).
+    p_r, p_c, p_v
+        Lists of arrays/lists accumulated in the per-aggregate loop.
+    counter
+        Number of coarse columns accumulated so far.
+
+    Returns
+    -------
+    counter : int
+        Final number of coarse columns (n_coarse).
+    """
+    if len(p_r) == 0:
+        # Fallback coarse space: one dof at row 0
+        p_r = [[0]]
+        p_c = [[0]]
+        p_v = [[1]]
+        counter = 1
+
+    p_r = np.concatenate(p_r, dtype=np.int32)
+    p_c = np.concatenate(p_c, dtype=np.int32)
+    p_v = np.concatenate(p_v, dtype=np.float64)
+
+    level.P = csr_array((p_v, (p_r, p_c)), shape=(n_fine, counter))
+    level.R = level.P.T.conjugate().tocsr()
+    return counter
+
+def _lsdd_coarsen_operators(*, B, BT, P, R):
+    """Form coarse operators via B_c = B P, BT_c = R BT, A_c = BT_c B_c.
+
+    Refactor-only extraction of the existing "coarsen" block.
+    """
+    B_c = B @ P
+    BT_c = R @ BT
+    A_c = BT_c @ B_c
+    A_c.sort_indices()  # IMPORTANT (keep behavior)
+    return A_c, B_c, BT_c
+
+
+def _lsdd_append_next_level(*, levels, A, B, BT):
+    """Append a new level and set A/B/BT/density (refactor-only)."""
+    levels.append(MultilevelSolver.Level())
+    nxt = levels[-1]
+    nxt.A = A
+    nxt.B = B
+    nxt.BT = BT
+    nxt.density = len(nxt.A.data) / (nxt.A.shape[0] ** 2)
+    return nxt
+
 
 def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
     kappa, nev, threshold, min_coarsening, filteringA, \
@@ -448,268 +860,88 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
         v_mult = np.zeros(AggOp.shape[0])
         blocksize = np.zeros(levels[-1].N, dtype=np.int32)
         v_row_mult = np.zeros(B.shape[0])
+        stats.n_aggs = levels[-1].N
+
 
     
     # ----------------------------------------------------------
     # --- Form overlapping subdomains and partition of unity ---
     # ----------------------------------------------------------
     with stats.timeit("overlap"):
-        nodes_vs_subdomains_r = []
-        nodes_vs_subdomains_c = []
-        nodes_vs_subdomains_v = []
-        for i in range(levels[-1].N):
-            # List of aggregate indices for nonoverlapping subdomains
-            levels[-1].nonoverlapping_subdomain[i] = np.asarray(
-                levels[-1].AggOpT.indices[levels[-1].AggOpT.indptr[i]:levels[-1].AggOpT.indptr[i + 1]], dtype=np.int32)
-            levels[-1].nIi[i] = len(levels[-1].nonoverlapping_subdomain[i])
-            levels[-1].overlapping_subdomain[i] = []
-
-            # Form overlapping subdomains as all fine-grid neighbors of each coarse aggregate
-            for j in levels[-1].nonoverlapping_subdomain[i]:
-                # Get the subdomain
-                levels[-1].overlapping_subdomain[i].append(
-                    # C.indices[C.indptr[j]:C.indptr[j + 1]])
-                    A.indices[A.indptr[j]:A.indptr[j + 1]])
-
-            levels[-1].overlapping_subdomain[i] = np.concatenate(
-                levels[-1].overlapping_subdomain[i], dtype=np.int32)
-            levels[-1].overlapping_subdomain[i] = np.unique(
-                levels[-1].overlapping_subdomain[i])
-            levels[-1].ni[i] = len(levels[-1].overlapping_subdomain[i])
-            
-            # Get the overlapping rows
-            levels[-1].overlapping_rows[i] = []
-            for j in levels[-1].nonoverlapping_subdomain[i]:
-                # Get the subdomain
-                levels[-1].overlapping_rows[i].append(BT.indices[BT.indptr[j]:BT.indptr[j + 1]])
-            
-            levels[-1].overlapping_rows[i] = np.concatenate(
-                levels[-1].overlapping_rows[i], dtype=np.int32)
-            levels[-1].overlapping_rows[i] = np.unique(levels[-1].overlapping_rows[i])
-            v_row_mult[levels[-1].overlapping_rows[i]] += 1
-            
-            blocksize[i] = len(levels[-1].overlapping_subdomain[i])
-            
-            # Loop over the subdomain and get the PoU
-            v_mult[levels[-1].overlapping_subdomain[i]] += 1
-            nodes_vs_subdomains_r.append(levels[-1].overlapping_subdomain[i])
-            nodes_vs_subdomains_c.append(i*np.ones(len(levels[-1].overlapping_subdomain[i]), dtype=np.int32))
-            nodes_vs_subdomains_v.append(np.ones(len(levels[-1].overlapping_subdomain[i])))
-        
-        nodes_vs_subdomains_r = np.concatenate(nodes_vs_subdomains_r, dtype=np.int32)
-        nodes_vs_subdomains_c = np.concatenate(nodes_vs_subdomains_c, dtype=np.int32)
-        nodes_vs_subdomains_v = np.concatenate(nodes_vs_subdomains_v, dtype=np.float64)
-        levels[-1].nodes_vs_subdomains = csr_array((nodes_vs_subdomains_v, (nodes_vs_subdomains_r, nodes_vs_subdomains_c)), shape=(A.shape[0], levels[-1].N))
-        levels[-1].T = levels[-1].nodes_vs_subdomains.T @ levels[-1].nodes_vs_subdomains
-        levels[-1].T.data[:] = 1
-        k_c = levels[-1].T @ np.ones(levels[-1].T.shape[0], dtype=levels[-1].T.data.dtype)
-        levels[-1].number_of_colors = max(k_c)    
-        levels[-1].multiplicity = max(v_row_mult)
-        
-        if print_info:
-            print("\tMean blocksize = {:.4g}".format(np.mean(blocksize)))
-            print("\tMax blocksize = {:.4g}".format(np.max(blocksize)))
-
-        # Form partition of unity vector separting overlapping and nonoverlapping domains.
-        for i in range(levels[-1].N):
-            levels[-1].PoU[i] = []
-            for j in levels[-1].overlapping_subdomain[i]:
-                # levels[-1].PoU[i].append(1/v_mult[j])
-                # Get the subdomain
-                if j in levels[-1].nonoverlapping_subdomain[i]:
-                    # levels[-1].PoU[i].append(1/v_mult[j])
-                    levels[-1].PoU[i].append(1)
-                else:
-                    levels[-1].PoU[i].append(0.0)
-            levels[-1].PoU[i] = np.array(levels[-1].PoU[i])
-
-        # Sanity check PoU correct
-        # --> checks that PoU is nonzero at one and only one DOF
-        temp = np.random.rand(A.shape[0])
-        temp2 = 0*temp
-        for i in range(levels[-1].N):
-            temp2[levels[-1].overlapping_subdomain[i]] += levels[-1].PoU[i] * temp[levels[-1].overlapping_subdomain[i]]
-        if(np.linalg.norm(temp2 - temp) > 1e-14*np.linalg.norm(temp)):
-            warn('Partition of unity is incorrect. This can happen if the partitioning strategy \
-                did not yield a nonoverlapping cover of the set of nodes')
-    
+        _lsdd_build_overlap_and_pou(
+            level=levels[-1],
+            A=A,
+            B=B,
+            BT=BT,
+            v_mult=v_mult,
+            v_row_mult=v_row_mult,
+            blocksize=blocksize,
+            print_info=print_info,
+        )
     
     # ---------------------------------------------------------------------
     # --- Extract local principle submatrices on overlapping subdomains ---
     # ---------------------------------------------------------------------
     with stats.timeit("extract_A"):
-        # Form sparse indptr and indices for principle submatrices over subdomains
-        levels[-1].subdomain = np.zeros(np.sum(blocksize), dtype=np.int32)
-        levels[-1].subdomain_ptr = np.zeros(levels[-1].N + 1, dtype=np.int32)
-        levels[-1].subdomain_ptr[0] = 0
-        for i in range(levels[-1].N):
-            levels[-1].subdomain_ptr[i+1] = levels[-1].subdomain_ptr[i] + blocksize[i]
-            levels[-1].subdomain[levels[-1].subdomain_ptr[i]:levels[-1].subdomain_ptr[i + 1]] = levels[-1].overlapping_subdomain[i]
+        _lsdd_extract_local_principal_submatrices(level=levels[-1], A=A, blocksize=blocksize)
 
-        levels[-1].submatrices_ptr = np.zeros(levels[-1].N + 1, dtype=np.int32)
-        levels[-1].submatrices_ptr[0] = 0
-        # BSR type sparse indexing, with blocksize[i]xblocksize[i] block at ith index
-        for i in range(levels[-1].N):
-            levels[-1].submatrices_ptr[i+1] = levels[-1].submatrices_ptr[i] + \
-                blocksize[i]*blocksize[i]
-
-        # Extract submatrices from overlapping subdomains 
-        levels[-1].submatrices = np.zeros(levels[-1].submatrices_ptr[-1],dtype=A.data.dtype)
-        amg_core.extract_subblocks(A.indptr, A.indices, A.data, levels[-1].submatrices, \
-                                    levels[-1].submatrices_ptr, levels[-1].subdomain, \
-                                    levels[-1].subdomain_ptr, \
-                                    int(levels[-1].subdomain_ptr.shape[0]-1), A.shape[0])
-
-        levels[-1].auxiliary = np.zeros(levels[-1].submatrices_ptr[-1])
-
-    
     # -----------------------------------------------------------
     # --- Form local outer products on overlapping subdomains ---
     # -----------------------------------------------------------
     with stats.timeit("outerprod"):
-        # amg_core C++ implementation of extracting local subdomain outerproducts
-        BTT = BT.T.conjugate().tocsr()
-        rows_indptr = np.zeros(levels[-1].N+1, dtype=np.int32)
-        cols_indptr = np.zeros(levels[-1].N+1, dtype=np.int32)
-        for i in range(levels[-1].N):
-            rows_indptr[i+1] = rows_indptr[i] + len(levels[-1].overlapping_rows[i])
-            cols_indptr[i+1] = cols_indptr[i] + len(levels[-1].overlapping_subdomain[i])
-
-        rows_flat = np.concatenate(levels[-1].overlapping_rows).astype(np.int32, copy=False)
-        cols_flat = np.concatenate(levels[-1].overlapping_subdomain).astype(np.int32, copy=False)
-
-        amg_core.local_outer_product(
-            B.shape[0], B.shape[1],
-            B.indptr, B.indices, B.data,
-            BTT.indptr, BTT.indices, BTT.data,
-            v_row_mult,
-            rows_flat, rows_indptr,
-            cols_flat, cols_indptr,
-            levels[-1].auxiliary, levels[-1].submatrices_ptr)
-
-        if threshold is None:
-            levels[-1].threshold = max(0.1,((kappa/levels[-1].number_of_colors) - 1)/ levels[-1].multiplicity)
-            # levels[-1].threshold = max(0.1,((kappa/3) - 1)/levels[-1].multiplicity)
-        else:
-            levels[-1].threshold = threshold
-        p_r = []
-        p_c = []
-        p_v = []
-        counter = 0
-        levels[-1].min_ev = 1e12
-
+        p_r, p_c, p_v, counter = _lsdd_local_outer_products_and_gep_init(
+            level=levels[-1],
+            B=B,
+            BT=BT,
+            v_row_mult=v_row_mult,
+            kappa=kappa,
+            threshold=threshold,
+        )
 
     # ---------------------------------------------------
     # --- Solve local generalized eigenvalue problems ---
     # ---------------------------------------------------
     with stats.timeit("gep"):
-        for i in range(levels[-1].N):
-
-            # Separate overlapping and nonoverlapping local DOFs
-            nonoverlap = np.where(levels[-1].PoU[i] == 1)[0]
-            overlap = np.where(levels[-1].PoU[i] == 0)[0]
-
-            # Overlapping subdomain matrix from local outer product of B, B^T
-            b = levels[-1].auxiliary[levels[-1].submatrices_ptr[i]:levels[-1].submatrices_ptr[i+1]]
-            bb = np.reshape(b,(int(np.sqrt(len(b))),int(np.sqrt(len(b)))))
-
-            # Local principle submatrix of overlapping subdomain
-            a = levels[-1].submatrices[levels[-1].submatrices_ptr[i]:levels[-1].submatrices_ptr[i+1]]
-            aa = np.reshape(a,(int(np.sqrt(len(a))),int(np.sqrt(len(a)))))
-
-            # Regularization
-            normbb = np.linalg.norm(bb, ord=2)
-            bb = bb + np.eye(bb.shape[0]) * (1e-10*normbb)
-
-            # Enforce minimum coarsening ratio on per aggregate basis
-            max_ev = aa.shape[0]
-            this_nev = nev
-            if min_coarsening is not None:
-                max_ev = len(levels[-1].nonoverlapping_subdomain[i])//min_coarsening
-            if nev is not None and min_coarsening is not None:
-                this_nev = np.min([nev,max_ev])
-
-            # Local principle submatrix restricted to nonoverlapping aggregate
-            aa = aa[nonoverlap,:][:,nonoverlap]
-
-            # Schur complement of outer product in nonoverlapping subdomain
-            S = bb[nonoverlap,:][:,nonoverlap] - bb[nonoverlap,:][:,overlap] @ \
-                np.linalg.inv(bb[overlap,:][:,overlap]) @ bb[overlap,:][:,nonoverlap]
-
-            # When possible only compute necessary eigenvalues/vectors
-            try:
-                if max_ev != S.shape[0] and max_ev > 0:
-                    E, V = eigh(aa,S,subset_by_index=[S.shape[0]-max_ev,S.shape[0]-1])
-                elif max_ev > 0:
-                    E, V = eigh(aa,S)
-            except:
-                import pdb
-                pdb.set_trace()
-
-            if this_nev is not None and this_nev > 0:
-                # NOTE : assumes eigenvalues in increasing order
-                E = E[-this_nev:]
-                levels[-1].min_ev = min(levels[-1].min_ev, E[-this_nev])
-                V = V[:,-this_nev:]
-                levels[-1].nev[i] = this_nev
-                for j in range(len(E)):
-                    temp_inds = np.arange(levels[-1].subdomain_ptr[i],levels[-1].subdomain_ptr[i + 1])[nonoverlap]
-                    temp_rows = levels[-1].subdomain[temp_inds]
-                    p_r.append(temp_rows)
-                    p_c.append([counter]*len(temp_rows))
-                    counter += 1
-                    p_v.append(V[:,j])
-            elif max_ev > 0:
-                counter_nev = 0
-                # NOTE : assumes eigenvalues in increasing order
-                for j in range(len(E)-1,len(E)-np.min([len(E),max_ev])-1,-1):
-                    if E[j] > levels[-1].threshold:
-                        temp_inds = np.arange(levels[-1].subdomain_ptr[i],levels[-1].subdomain_ptr[i + 1])[nonoverlap]
-                        temp_rows = levels[-1].subdomain[temp_inds]
-                        counter_nev += 1
-                        levels[-1].min_ev = min(levels[-1].min_ev, E[j])
-                        p_r.append(temp_rows)
-                        p_c.append([counter]*len(temp_rows))
-                        counter += 1
-                        p_v.append(V[:,j])
-                levels[-1].nev[i] = counter_nev
+        level = levels[-1]
+        for i in range(level.N):
+            counter = _lsdd_process_one_aggregate_gep(
+                i=i,
+                level=level,
+                nev=nev,
+                min_coarsening=min_coarsening,
+                counter=counter,
+                p_r=p_r,
+                p_c=p_c,
+                p_v=p_v,
+            )
 
     # ----------------------------------------------
     # --- Assemble P from the local eigenvectors ---
     # ----------------------------------------------
     with stats.timeit("assemble_P"):
-        if(len(p_r)) == 0:
-            p_r = [[0]]
-            p_c = [[0]]
-            p_v = [[1]]
-            counter = 1
-        p_r = np.concatenate(p_r, dtype=np.int32)
-        p_c = np.concatenate(p_c, dtype=np.int32)
-        p_v = np.concatenate(p_v, dtype=np.float64)
-        levels[-1].P = csr_array((p_v, (p_r, p_c)), shape=(A.shape[0], counter))
-        levels[-1].R = levels[-1].P.T.conjugate().tocsr()
+        counter = _lsdd_assemble_P_from_triplets(
+            level=levels[-1],
+            n_fine=A.shape[0],
+            p_r=p_r,
+            p_c=p_c,
+            p_v=p_v,
+            counter=counter,
+        )
 
     # -------------------------------------------
     # --- Form coarse grid operator A = R A P ---
     # -------------------------------------------
     with stats.timeit("coarsen"):
-        B = B @ levels[-1].P
-        BT = levels[-1].R @ BT
-        A = BT @ B
-        A.sort_indices()    # THIS IS IMPORTANT
+        A, B, BT = _lsdd_coarsen_operators(B=B, BT=BT, P=levels[-1].P, R=levels[-1].R)
 
-    if print_info:
-        print("\tAggregate size = {:.3g}".format(AggOp.shape[0]/AggOp.shape[1]))
-        print("\tEigenvectors/agg = {:.3g}".format(np.mean(levels[-1].nev)))
-        print("\tCoarsening ratio = {:.3g}".format(levels[-1].A.shape[0]/A.shape[0]))
 
+    stats.n_coarse = A.shape[0]
+    stats.extra["mean_nev"] = float(np.mean(levels[-1].nev))
+    stats.extra["min_ev"] = float(levels[-1].min_ev)
+
+    _lsdd_append_next_level(levels=levels, A=A, B=B, BT=BT)
     _lsdd_print_level_summary(stats, print_info=print_info)
 
-    levels.append(MultilevelSolver.Level())
-    levels[-1].A = A
-    levels[-1].B = B
-    levels[-1].BT = BT
-    levels[-1].density = len(levels[-1].A.data) / (levels[-1].A.shape[0] ** 2)
 
     
 
