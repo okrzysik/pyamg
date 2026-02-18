@@ -3,8 +3,12 @@
 Copied from least_squares_dd.py at commit ba9bfe81d645dd94739fc36604779eb70ff608da
 
 ruff check least_squares_dd_exp.py --select F,E9
+
+PYAMG_LSDD_PRINT_INFO=1 pytest -q -s ../tests/schwarz/test_lsdd_compare.py
 """
 
+
+from __future__ import annotations
 
 from warnings import warn
 import numpy as np
@@ -28,6 +32,90 @@ from pyamg import amg_core
 import time
 
 
+
+
+from dataclasses import dataclass, field
+from contextlib import contextmanager
+from typing import Any, Dict, Optional
+
+
+@dataclass
+class LsddLevelStats:
+    """Per-level setup stats for LS–AMG–DD.
+
+    This is *refactor-only* scaffolding: it does not change the algorithm.
+
+    Parameters
+    ----------
+    level
+        Level index ℓ (0 = finest).
+    n_fine
+        Dimension of A_ℓ (equivalently: number of columns of G_ℓ / B_ℓ).
+    n_aggs
+        Number of aggregates on this level (|{ω_i^{(ℓ)} }|).
+    n_coarse
+        Dimension of A_{ℓ+1} after coarsening.
+
+    Attributes
+    ----------
+    timings
+        Wall-time in seconds for named phases (e.g. "strength", "aggregate", "gep").
+    extra
+        Misc scalar diagnostics (operator complexity, mean overlap size, nev totals, etc.).
+    """
+
+    level: int
+    n_fine: int
+    n_aggs: Optional[int] = None
+    n_coarse: Optional[int] = None
+    timings: Dict[str, float] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    @contextmanager
+    def timeit(self, key: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.timings[key] = self.timings.get(key, 0.0) + (time.perf_counter() - t0)
+
+
+def _lsdd_print_level_summary(stats: LsddLevelStats, *, print_info: bool, prefix: str = "LS-DD") -> None:
+    """Print a one-line summary for a level (only if print_info=True)."""
+    if not print_info:
+        return
+
+    parts = [f"{prefix} ℓ={stats.level}", f"n={stats.n_fine}"]
+    if stats.n_aggs is not None:
+        parts.append(f"n_aggs={stats.n_aggs}")
+    if stats.n_coarse is not None:
+        parts.append(f"n_c={stats.n_coarse}")
+
+    if stats.timings:
+        order = [
+            "strength",
+            "aggregate",
+            "overlap",
+            "extract_A",
+            "outerprod",
+            "gep",
+            "assemble_P",
+            "coarsen",
+        ]
+        t_parts = []
+        for k in order:
+            if k in stats.timings:
+                t_parts.append(f"{k}={stats.timings[k]:.3f}s")
+        for k, v in sorted(stats.timings.items()):
+            if k not in order:
+                t_parts.append(f"{k}={v:.3f}s")
+        parts.append("timings:[" + ", ".join(t_parts) + "]")
+
+    if stats.extra:
+        extras = ", ".join(f"{k}={v}" for k, v in stats.extra.items())
+        parts.append("extra:[" + extras + "]")
+
+    print(" | ".join(parts))
 
 
 
@@ -221,7 +309,14 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
     A = levels[-1].A
     B = levels[-1].B
     BT = levels[-1].BT
-    # Filter operator.
+
+    
+    # Initialize stats object for this level
+    stats = LsddLevelStats(level=len(levels) - 1, n_fine=A.shape[0])
+
+    # -----------------------
+    # --- Filter operator ---
+    # -----------------------
     if len(levels) > 1:
         if (filteringB is not None) and (filteringB[1] != 0):
             if print_info:
@@ -240,373 +335,384 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
             if print_info:
                 print("B NNZ after filtering", len(B.data))
 
-    t0 = time.perf_counter()
 
-    # Compute the strength-of-connection matrix C, where larger
-    # C[i,j] denote stronger couplings between i and j.
-    fn, kwargs = unpack_arg(strength[len(levels)-1])
-    if fn == 'symmetric':
-        C = symmetric_strength_of_connection(A, **kwargs)
-    elif fn == 'classical':
-        C = classical_strength_of_connection(A, **kwargs)
-        # test = abs(A).tocsr()
-        # if (np.max(test.indptr-C.indptr) != 0) or (np.max(test.indices-C.indices) != 0):
-        #     import pdb; pdb.set_trace()
-    elif fn == 'distance':
-        C = distance_strength_of_connection(A, **kwargs)
-    elif fn in ('ode', 'evolution'):
-        if 'B' in kwargs:
-            C = evolution_strength_of_connection(A, **kwargs)
-        else:
-            C = evolution_strength_of_connection(A, B, **kwargs)
-    elif fn == 'energy_based':
-        C = energy_based_strength_of_connection(A, **kwargs)
-    elif fn == 'predefined':
-        C = kwargs['C'].tocsr()
-    elif fn == 'algebraic_distance':
-        C = algebraic_distance(A, **kwargs)
-    elif fn == 'affinity':
-        C = affinity_distance(A, **kwargs)
-    ### Hussam's original implementation
-    elif fn is None:
-        C = abs(A.copy()).tocsr()
-    else:
-        raise ValueError(f'Unrecognized strength of connection method: {fn!s}')
-
-    # Compute the aggregation matrix AggOp (i.e., the nodal coarsening of A).
-    # AggOp is a boolean matrix, where the sparsity pattern for the k-th column
-    # denotes the fine-grid nodes agglomerated into k-th coarse-grid node.
-    fn, kwargs = unpack_arg(aggregate[len(levels)-1])
-    C.eliminate_zeros()
-    Cnodes = None
-    Aggs = []
-    for i in range(0,agg_levels):
-        if fn == 'standard':
-            AggOp, Cnodes = standard_aggregation(C, **kwargs)
-        elif fn == 'd2C':
-            C = C @ C
-            AggOp, Cnodes = standard_aggregation(C, **kwargs)
-        elif fn == 'd3C':
-            C = C @ C @ C
-            AggOp, Cnodes = standard_aggregation(C, **kwargs)
-        elif fn == 'naive':
-            AggOp, Cnodes = naive_aggregation(C, **kwargs)
-        elif fn == 'lloyd':
-            AggOp, Cnodes = lloyd_aggregation(C, **kwargs)
-        elif fn == 'balanced lloyd':
-            if 'pad' in kwargs:
-                kwargs['A'] = A
-            AggOp, Cnodes = balanced_lloyd_aggregation(C, **kwargs)
-        elif fn == 'metis':
-            C.data[:] = 1.0
-            if(len(levels) == 1):
-                AggOp = metis_aggregation(C, **kwargs)
+    # --------------------------------------
+    # --- Compute strength of connection ---
+    # --------------------------------------
+    with stats.timeit("strength"):
+        # Compute the strength-of-connection matrix C, where larger
+        # C[i,j] denote stronger couplings between i and j.
+        fn, kwargs = unpack_arg(strength[len(levels)-1])
+        if fn == 'symmetric':
+            C = symmetric_strength_of_connection(A, **kwargs)
+        elif fn == 'classical':
+            C = classical_strength_of_connection(A, **kwargs)
+            # test = abs(A).tocsr()
+            # if (np.max(test.indptr-C.indptr) != 0) or (np.max(test.indices-C.indices) != 0):
+            #     import pdb; pdb.set_trace()
+        elif fn == 'distance':
+            C = distance_strength_of_connection(A, **kwargs)
+        elif fn in ('ode', 'evolution'):
+            if 'B' in kwargs:
+                C = evolution_strength_of_connection(A, **kwargs)
             else:
-                #ratio = levels[-2].N/16/levels[-1].A.shape[0]
-                # ratio = max(levels[-2].nev)*4/levels[-1].A.shape[0]
-                # AggOp = metis_aggregation(C, ratio=ratio)
-                AggOp = metis_aggregation(C, **kwargs)
-        elif fn == 'pairwise':
-            AggOp = pairwise_aggregation(A, **kwargs)[0]
+                C = evolution_strength_of_connection(A, B, **kwargs)
+        elif fn == 'energy_based':
+            C = energy_based_strength_of_connection(A, **kwargs)
         elif fn == 'predefined':
-            AggOp = kwargs['AggOp'].tocsr()
+            C = kwargs['C'].tocsr()
+        elif fn == 'algebraic_distance':
+            C = algebraic_distance(A, **kwargs)
+        elif fn == 'affinity':
+            C = affinity_distance(A, **kwargs)
+        ### Hussam's original implementation
+        elif fn is None:
+            C = abs(A.copy()).tocsr()
         else:
-            raise ValueError(f'Unrecognized aggregation method {fn!s}')
+            raise ValueError(f'Unrecognized strength of connection method: {fn!s}')
 
-        Aggs.append(AggOp)
-        if i < agg_levels-1:
-            C = (AggOp.T @ C @ AggOp).tocsr()
 
-    # Create aggregation matrix as product of levels
-    AggOp = Aggs[0]
-    for i in range(1,agg_levels):
-        AggOp = AggOp @ Aggs[i]
-
-    # AggOp = AggOp.tocsc()
-    # AggOp = _remove_empty_columns(AggOp)
-    # AggOp = _add_columns_containing_isolated_nodes(AggOp)
-    # AggOp = AggOp.tocsr()
-    nc_temp = AggOp.shape[1]
-    print("\tNum aggregates = {:.4g}".format(nc_temp))
-    print("\tAv. aggregate size = {:.4g}".format(AggOp.shape[0]/AggOp.shape[1]))
-    AggOp = _fill_unaggregated_by_neighbors(A, AggOp, make_singletons=True)
-    print("\tNum singletons = {:.4g}".format(AggOp.shape[1]-nc_temp))
-
-    levels[-1].AggOp = AggOp
-    levels[-1].AggOpT = AggOp.T.tocsr()
-    levels[-1].N = AggOp.shape[1]  # number of coarse grid points
-    levels[-1].nonoverlapping_subdomain = [None]*levels[-1].N
-    levels[-1].overlapping_subdomain = [None]*levels[-1].N
-    levels[-1].PoU = [None]*levels[-1].N
-    levels[-1].overlapping_rows = [None]*levels[-1].N
-    levels[-1].nIi = np.zeros(levels[-1].N, dtype=np.int32)
-    levels[-1].ni = np.zeros(levels[-1].N, dtype=np.int32)
-    levels[-1].nev = np.zeros(levels[-1].N, dtype=np.int32)
-    v_mult = np.zeros(AggOp.shape[0])
-    blocksize = np.zeros(levels[-1].N, dtype=np.int32)
-    v_row_mult = np.zeros(B.shape[0])
-
-    t1 = time.perf_counter()
-    if print_info:
-        print("\tAggregation time = {:.4g}".format(t1 - t0))
-
-    t0 = time.perf_counter()
-
-    nodes_vs_subdomains_r = []
-    nodes_vs_subdomains_c = []
-    nodes_vs_subdomains_v = []
-    for i in range(levels[-1].N):
-        # List of aggregate indices for nonoverlapping subdomains
-        levels[-1].nonoverlapping_subdomain[i] = np.asarray(
-            levels[-1].AggOpT.indices[levels[-1].AggOpT.indptr[i]:levels[-1].AggOpT.indptr[i + 1]], dtype=np.int32)
-        levels[-1].nIi[i] = len(levels[-1].nonoverlapping_subdomain[i])
-        levels[-1].overlapping_subdomain[i] = []
-
-        # Form overlapping subdomains as all fine-grid neighbors of each coarse aggregate
-        for j in levels[-1].nonoverlapping_subdomain[i]:
-            # Get the subdomain
-            levels[-1].overlapping_subdomain[i].append(
-                # C.indices[C.indptr[j]:C.indptr[j + 1]])
-                A.indices[A.indptr[j]:A.indptr[j + 1]])
-
-        levels[-1].overlapping_subdomain[i] = np.concatenate(
-            levels[-1].overlapping_subdomain[i], dtype=np.int32)
-        levels[-1].overlapping_subdomain[i] = np.unique(
-            levels[-1].overlapping_subdomain[i])
-        levels[-1].ni[i] = len(levels[-1].overlapping_subdomain[i])
-        
-        # Get the overlapping rows
-        levels[-1].overlapping_rows[i] = []
-        for j in levels[-1].nonoverlapping_subdomain[i]:
-            # Get the subdomain
-            levels[-1].overlapping_rows[i].append(BT.indices[BT.indptr[j]:BT.indptr[j + 1]])
-        
-        levels[-1].overlapping_rows[i] = np.concatenate(
-            levels[-1].overlapping_rows[i], dtype=np.int32)
-        levels[-1].overlapping_rows[i] = np.unique(levels[-1].overlapping_rows[i])
-        v_row_mult[levels[-1].overlapping_rows[i]] += 1
-        
-        blocksize[i] = len(levels[-1].overlapping_subdomain[i])
-        
-        # Loop over the subdomain and get the PoU
-        v_mult[levels[-1].overlapping_subdomain[i]] += 1
-        nodes_vs_subdomains_r.append(levels[-1].overlapping_subdomain[i])
-        nodes_vs_subdomains_c.append(i*np.ones(len(levels[-1].overlapping_subdomain[i]), dtype=np.int32))
-        nodes_vs_subdomains_v.append(np.ones(len(levels[-1].overlapping_subdomain[i])))
-    
-    nodes_vs_subdomains_r = np.concatenate(nodes_vs_subdomains_r, dtype=np.int32)
-    nodes_vs_subdomains_c = np.concatenate(nodes_vs_subdomains_c, dtype=np.int32)
-    nodes_vs_subdomains_v = np.concatenate(nodes_vs_subdomains_v, dtype=np.float64)
-    levels[-1].nodes_vs_subdomains = csr_array((nodes_vs_subdomains_v, (nodes_vs_subdomains_r, nodes_vs_subdomains_c)), shape=(A.shape[0], levels[-1].N))
-    levels[-1].T = levels[-1].nodes_vs_subdomains.T @ levels[-1].nodes_vs_subdomains
-    levels[-1].T.data[:] = 1
-    k_c = levels[-1].T @ np.ones(levels[-1].T.shape[0], dtype=levels[-1].T.data.dtype)
-    levels[-1].number_of_colors = max(k_c)    
-    levels[-1].multiplicity = max(v_row_mult)
-    
-    if print_info:
-        print("\tMean blocksize = {:.4g}".format(np.mean(blocksize)))
-        print("\tMax blocksize = {:.4g}".format(np.max(blocksize)))
-
-    # Form partition of unity vector separting overlapping and nonoverlapping domains.
-    for i in range(levels[-1].N):
-        levels[-1].PoU[i] = []
-        for j in levels[-1].overlapping_subdomain[i]:
-            # levels[-1].PoU[i].append(1/v_mult[j])
-            # Get the subdomain
-            if j in levels[-1].nonoverlapping_subdomain[i]:
-                # levels[-1].PoU[i].append(1/v_mult[j])
-                levels[-1].PoU[i].append(1)
+    # ----------------------------------------
+    # --- Compute aggregation matrix AggOp ---
+    # ----------------------------------------
+    with stats.timeit("aggregate"):
+        # Compute the aggregation matrix AggOp (i.e., the nodal coarsening of A).
+        # AggOp is a boolean matrix, where the sparsity pattern for the k-th column
+        # denotes the fine-grid nodes agglomerated into k-th coarse-grid node.
+        fn, kwargs = unpack_arg(aggregate[len(levels)-1])
+        C.eliminate_zeros()
+        Cnodes = None
+        Aggs = []
+        for i in range(0,agg_levels):
+            if fn == 'standard':
+                AggOp, Cnodes = standard_aggregation(C, **kwargs)
+            elif fn == 'd2C':
+                C = C @ C
+                AggOp, Cnodes = standard_aggregation(C, **kwargs)
+            elif fn == 'd3C':
+                C = C @ C @ C
+                AggOp, Cnodes = standard_aggregation(C, **kwargs)
+            elif fn == 'naive':
+                AggOp, Cnodes = naive_aggregation(C, **kwargs)
+            elif fn == 'lloyd':
+                AggOp, Cnodes = lloyd_aggregation(C, **kwargs)
+            elif fn == 'balanced lloyd':
+                if 'pad' in kwargs:
+                    kwargs['A'] = A
+                AggOp, Cnodes = balanced_lloyd_aggregation(C, **kwargs)
+            elif fn == 'metis':
+                C.data[:] = 1.0
+                if(len(levels) == 1):
+                    AggOp = metis_aggregation(C, **kwargs)
+                else:
+                    #ratio = levels[-2].N/16/levels[-1].A.shape[0]
+                    # ratio = max(levels[-2].nev)*4/levels[-1].A.shape[0]
+                    # AggOp = metis_aggregation(C, ratio=ratio)
+                    AggOp = metis_aggregation(C, **kwargs)
+            elif fn == 'pairwise':
+                AggOp = pairwise_aggregation(A, **kwargs)[0]
+            elif fn == 'predefined':
+                AggOp = kwargs['AggOp'].tocsr()
             else:
-                levels[-1].PoU[i].append(0.0)
-        levels[-1].PoU[i] = np.array(levels[-1].PoU[i])
+                raise ValueError(f'Unrecognized aggregation method {fn!s}')
 
-    t1 = time.perf_counter()
-    if print_info:
-        print("\tAgg processing time = {:.4g}".format(t1 - t0))
+            Aggs.append(AggOp)
+            if i < agg_levels-1:
+                C = (AggOp.T @ C @ AggOp).tocsr()
 
-    t0 = time.perf_counter()
+        # Create aggregation matrix as product of levels
+        AggOp = Aggs[0]
+        for i in range(1,agg_levels):
+            AggOp = AggOp @ Aggs[i]
 
-    # Sanity check PoU correct
-    # --> checks that PoU is nonzero at one and only one DOF
-    temp = np.random.rand(A.shape[0])
-    temp2 = 0*temp
-    for i in range(levels[-1].N):
-        temp2[levels[-1].overlapping_subdomain[i]] += levels[-1].PoU[i] * temp[levels[-1].overlapping_subdomain[i]]
-    if(np.linalg.norm(temp2 - temp) > 1e-14*np.linalg.norm(temp)):
-        warn('Partition of unity is incorrect. This can happen if the partitioning strategy \
-            did not yield a nonoverlapping cover of the set of nodes')
+        # AggOp = AggOp.tocsc()
+        # AggOp = _remove_empty_columns(AggOp)
+        # AggOp = _add_columns_containing_isolated_nodes(AggOp)
+        # AggOp = AggOp.tocsr()
+        nc_temp = AggOp.shape[1]
+        print("\tNum aggregates = {:.4g}".format(nc_temp))
+        print("\tAv. aggregate size = {:.4g}".format(AggOp.shape[0]/AggOp.shape[1]))
+        AggOp = _fill_unaggregated_by_neighbors(A, AggOp, make_singletons=True)
+        print("\tNum singletons = {:.4g}".format(AggOp.shape[1]-nc_temp))
+
+        levels[-1].AggOp = AggOp
+        levels[-1].AggOpT = AggOp.T.tocsr()
+        levels[-1].N = AggOp.shape[1]  # number of coarse grid points
+        levels[-1].nonoverlapping_subdomain = [None]*levels[-1].N
+        levels[-1].overlapping_subdomain = [None]*levels[-1].N
+        levels[-1].PoU = [None]*levels[-1].N
+        levels[-1].overlapping_rows = [None]*levels[-1].N
+        levels[-1].nIi = np.zeros(levels[-1].N, dtype=np.int32)
+        levels[-1].ni = np.zeros(levels[-1].N, dtype=np.int32)
+        levels[-1].nev = np.zeros(levels[-1].N, dtype=np.int32)
+        v_mult = np.zeros(AggOp.shape[0])
+        blocksize = np.zeros(levels[-1].N, dtype=np.int32)
+        v_row_mult = np.zeros(B.shape[0])
+
     
-    # Form sparse indptr and indices for principle submatrices over subdomains
-    levels[-1].subdomain = np.zeros(np.sum(blocksize), dtype=np.int32)
-    levels[-1].subdomain_ptr = np.zeros(levels[-1].N + 1, dtype=np.int32)
-    levels[-1].subdomain_ptr[0] = 0
-    for i in range(levels[-1].N):
-        levels[-1].subdomain_ptr[i+1] = levels[-1].subdomain_ptr[i] + blocksize[i]
-        levels[-1].subdomain[levels[-1].subdomain_ptr[i]:levels[-1].subdomain_ptr[i + 1]] = levels[-1].overlapping_subdomain[i]
+    # ----------------------------------------------------------
+    # --- Form overlapping subdomains and partition of unity ---
+    # ----------------------------------------------------------
+    with stats.timeit("overlap"):
+        nodes_vs_subdomains_r = []
+        nodes_vs_subdomains_c = []
+        nodes_vs_subdomains_v = []
+        for i in range(levels[-1].N):
+            # List of aggregate indices for nonoverlapping subdomains
+            levels[-1].nonoverlapping_subdomain[i] = np.asarray(
+                levels[-1].AggOpT.indices[levels[-1].AggOpT.indptr[i]:levels[-1].AggOpT.indptr[i + 1]], dtype=np.int32)
+            levels[-1].nIi[i] = len(levels[-1].nonoverlapping_subdomain[i])
+            levels[-1].overlapping_subdomain[i] = []
 
-    levels[-1].submatrices_ptr = np.zeros(levels[-1].N + 1, dtype=np.int32)
-    levels[-1].submatrices_ptr[0] = 0
-    # BSR type sparse indexing, with blocksize[i]xblocksize[i] block at ith index
-    for i in range(levels[-1].N):
-        levels[-1].submatrices_ptr[i+1] = levels[-1].submatrices_ptr[i] + \
-            blocksize[i]*blocksize[i]
+            # Form overlapping subdomains as all fine-grid neighbors of each coarse aggregate
+            for j in levels[-1].nonoverlapping_subdomain[i]:
+                # Get the subdomain
+                levels[-1].overlapping_subdomain[i].append(
+                    # C.indices[C.indptr[j]:C.indptr[j + 1]])
+                    A.indices[A.indptr[j]:A.indptr[j + 1]])
 
-    # Extract submatrices from overlapping subdomains 
-    levels[-1].submatrices = np.zeros(levels[-1].submatrices_ptr[-1],dtype=A.data.dtype)
-    amg_core.extract_subblocks(A.indptr, A.indices, A.data, levels[-1].submatrices, \
-                                levels[-1].submatrices_ptr, levels[-1].subdomain, \
-                                levels[-1].subdomain_ptr, \
-                                int(levels[-1].subdomain_ptr.shape[0]-1), A.shape[0])
+            levels[-1].overlapping_subdomain[i] = np.concatenate(
+                levels[-1].overlapping_subdomain[i], dtype=np.int32)
+            levels[-1].overlapping_subdomain[i] = np.unique(
+                levels[-1].overlapping_subdomain[i])
+            levels[-1].ni[i] = len(levels[-1].overlapping_subdomain[i])
+            
+            # Get the overlapping rows
+            levels[-1].overlapping_rows[i] = []
+            for j in levels[-1].nonoverlapping_subdomain[i]:
+                # Get the subdomain
+                levels[-1].overlapping_rows[i].append(BT.indices[BT.indptr[j]:BT.indptr[j + 1]])
+            
+            levels[-1].overlapping_rows[i] = np.concatenate(
+                levels[-1].overlapping_rows[i], dtype=np.int32)
+            levels[-1].overlapping_rows[i] = np.unique(levels[-1].overlapping_rows[i])
+            v_row_mult[levels[-1].overlapping_rows[i]] += 1
+            
+            blocksize[i] = len(levels[-1].overlapping_subdomain[i])
+            
+            # Loop over the subdomain and get the PoU
+            v_mult[levels[-1].overlapping_subdomain[i]] += 1
+            nodes_vs_subdomains_r.append(levels[-1].overlapping_subdomain[i])
+            nodes_vs_subdomains_c.append(i*np.ones(len(levels[-1].overlapping_subdomain[i]), dtype=np.int32))
+            nodes_vs_subdomains_v.append(np.ones(len(levels[-1].overlapping_subdomain[i])))
+        
+        nodes_vs_subdomains_r = np.concatenate(nodes_vs_subdomains_r, dtype=np.int32)
+        nodes_vs_subdomains_c = np.concatenate(nodes_vs_subdomains_c, dtype=np.int32)
+        nodes_vs_subdomains_v = np.concatenate(nodes_vs_subdomains_v, dtype=np.float64)
+        levels[-1].nodes_vs_subdomains = csr_array((nodes_vs_subdomains_v, (nodes_vs_subdomains_r, nodes_vs_subdomains_c)), shape=(A.shape[0], levels[-1].N))
+        levels[-1].T = levels[-1].nodes_vs_subdomains.T @ levels[-1].nodes_vs_subdomains
+        levels[-1].T.data[:] = 1
+        k_c = levels[-1].T @ np.ones(levels[-1].T.shape[0], dtype=levels[-1].T.data.dtype)
+        levels[-1].number_of_colors = max(k_c)    
+        levels[-1].multiplicity = max(v_row_mult)
+        
+        if print_info:
+            print("\tMean blocksize = {:.4g}".format(np.mean(blocksize)))
+            print("\tMax blocksize = {:.4g}".format(np.max(blocksize)))
 
-    levels[-1].auxiliary = np.zeros(levels[-1].submatrices_ptr[-1])
+        # Form partition of unity vector separting overlapping and nonoverlapping domains.
+        for i in range(levels[-1].N):
+            levels[-1].PoU[i] = []
+            for j in levels[-1].overlapping_subdomain[i]:
+                # levels[-1].PoU[i].append(1/v_mult[j])
+                # Get the subdomain
+                if j in levels[-1].nonoverlapping_subdomain[i]:
+                    # levels[-1].PoU[i].append(1/v_mult[j])
+                    levels[-1].PoU[i].append(1)
+                else:
+                    levels[-1].PoU[i].append(0.0)
+            levels[-1].PoU[i] = np.array(levels[-1].PoU[i])
 
-    t1 = time.perf_counter()
-    if print_info:
-        print("\tPOU check time = {:.4g}".format(t1 - t0))
-
-    t0 = time.perf_counter()
-
-    # amg_core C++ implementation of extracting local subdomain outerproducts
-    BTT = BT.T.conjugate().tocsr()
-    rows_indptr = np.zeros(levels[-1].N+1, dtype=np.int32)
-    cols_indptr = np.zeros(levels[-1].N+1, dtype=np.int32)
-    for i in range(levels[-1].N):
-        rows_indptr[i+1] = rows_indptr[i] + len(levels[-1].overlapping_rows[i])
-        cols_indptr[i+1] = cols_indptr[i] + len(levels[-1].overlapping_subdomain[i])
-
-    rows_flat = np.concatenate(levels[-1].overlapping_rows).astype(np.int32, copy=False)
-    cols_flat = np.concatenate(levels[-1].overlapping_subdomain).astype(np.int32, copy=False)
-
-    amg_core.local_outer_product(
-        B.shape[0], B.shape[1],
-        B.indptr, B.indices, B.data,
-        BTT.indptr, BTT.indices, BTT.data,
-        v_row_mult,
-        rows_flat, rows_indptr,
-        cols_flat, cols_indptr,
-        levels[-1].auxiliary, levels[-1].submatrices_ptr)
-
-    if threshold is None:
-        levels[-1].threshold = max(0.1,((kappa/levels[-1].number_of_colors) - 1)/ levels[-1].multiplicity)
-        # levels[-1].threshold = max(0.1,((kappa/3) - 1)/levels[-1].multiplicity)
-    else:
-        levels[-1].threshold = threshold
-    p_r = []
-    p_c = []
-    p_v = []
-    counter = 0
-    levels[-1].min_ev = 1e12
+        # Sanity check PoU correct
+        # --> checks that PoU is nonzero at one and only one DOF
+        temp = np.random.rand(A.shape[0])
+        temp2 = 0*temp
+        for i in range(levels[-1].N):
+            temp2[levels[-1].overlapping_subdomain[i]] += levels[-1].PoU[i] * temp[levels[-1].overlapping_subdomain[i]]
+        if(np.linalg.norm(temp2 - temp) > 1e-14*np.linalg.norm(temp)):
+            warn('Partition of unity is incorrect. This can happen if the partitioning strategy \
+                did not yield a nonoverlapping cover of the set of nodes')
     
-    t1 = time.perf_counter()
-    if print_info:
-        print("\tExtract subdomain time = {:.4g}".format(t1 - t0))
+    
+    # ---------------------------------------------------------------------
+    # --- Extract local principle submatrices on overlapping subdomains ---
+    # ---------------------------------------------------------------------
+    with stats.timeit("extract_A"):
+        # Form sparse indptr and indices for principle submatrices over subdomains
+        levels[-1].subdomain = np.zeros(np.sum(blocksize), dtype=np.int32)
+        levels[-1].subdomain_ptr = np.zeros(levels[-1].N + 1, dtype=np.int32)
+        levels[-1].subdomain_ptr[0] = 0
+        for i in range(levels[-1].N):
+            levels[-1].subdomain_ptr[i+1] = levels[-1].subdomain_ptr[i] + blocksize[i]
+            levels[-1].subdomain[levels[-1].subdomain_ptr[i]:levels[-1].subdomain_ptr[i + 1]] = levels[-1].overlapping_subdomain[i]
 
-    t0 = time.perf_counter()
-    for i in range(levels[-1].N):
+        levels[-1].submatrices_ptr = np.zeros(levels[-1].N + 1, dtype=np.int32)
+        levels[-1].submatrices_ptr[0] = 0
+        # BSR type sparse indexing, with blocksize[i]xblocksize[i] block at ith index
+        for i in range(levels[-1].N):
+            levels[-1].submatrices_ptr[i+1] = levels[-1].submatrices_ptr[i] + \
+                blocksize[i]*blocksize[i]
 
-        # Separate overlapping and nonoverlapping local DOFs
-        nonoverlap = np.where(levels[-1].PoU[i] == 1)[0]
-        overlap = np.where(levels[-1].PoU[i] == 0)[0]
+        # Extract submatrices from overlapping subdomains 
+        levels[-1].submatrices = np.zeros(levels[-1].submatrices_ptr[-1],dtype=A.data.dtype)
+        amg_core.extract_subblocks(A.indptr, A.indices, A.data, levels[-1].submatrices, \
+                                    levels[-1].submatrices_ptr, levels[-1].subdomain, \
+                                    levels[-1].subdomain_ptr, \
+                                    int(levels[-1].subdomain_ptr.shape[0]-1), A.shape[0])
 
-        # Overlapping subdomain matrix from local outer product of B, B^T
-        b = levels[-1].auxiliary[levels[-1].submatrices_ptr[i]:levels[-1].submatrices_ptr[i+1]]
-        bb = np.reshape(b,(int(np.sqrt(len(b))),int(np.sqrt(len(b)))))
+        levels[-1].auxiliary = np.zeros(levels[-1].submatrices_ptr[-1])
 
-        # Local principle submatrix of overlapping subdomain
-        a = levels[-1].submatrices[levels[-1].submatrices_ptr[i]:levels[-1].submatrices_ptr[i+1]]
-        aa = np.reshape(a,(int(np.sqrt(len(a))),int(np.sqrt(len(a)))))
+    
+    # -----------------------------------------------------------
+    # --- Form local outer products on overlapping subdomains ---
+    # -----------------------------------------------------------
+    with stats.timeit("outerprod"):
+        # amg_core C++ implementation of extracting local subdomain outerproducts
+        BTT = BT.T.conjugate().tocsr()
+        rows_indptr = np.zeros(levels[-1].N+1, dtype=np.int32)
+        cols_indptr = np.zeros(levels[-1].N+1, dtype=np.int32)
+        for i in range(levels[-1].N):
+            rows_indptr[i+1] = rows_indptr[i] + len(levels[-1].overlapping_rows[i])
+            cols_indptr[i+1] = cols_indptr[i] + len(levels[-1].overlapping_subdomain[i])
 
-        # Regularization
-        normbb = np.linalg.norm(bb, ord=2)
-        bb = bb + np.eye(bb.shape[0]) * (1e-10*normbb)
+        rows_flat = np.concatenate(levels[-1].overlapping_rows).astype(np.int32, copy=False)
+        cols_flat = np.concatenate(levels[-1].overlapping_subdomain).astype(np.int32, copy=False)
 
-        # Enforce minimum coarsening ratio on per aggregate basis
-        max_ev = aa.shape[0]
-        this_nev = nev
-        if min_coarsening is not None:
-            max_ev = len(levels[-1].nonoverlapping_subdomain[i])//min_coarsening
-        if nev is not None and min_coarsening is not None:
-            this_nev = np.min([nev,max_ev])
+        amg_core.local_outer_product(
+            B.shape[0], B.shape[1],
+            B.indptr, B.indices, B.data,
+            BTT.indptr, BTT.indices, BTT.data,
+            v_row_mult,
+            rows_flat, rows_indptr,
+            cols_flat, cols_indptr,
+            levels[-1].auxiliary, levels[-1].submatrices_ptr)
 
-        # Local principle submatrix restricted to nonoverlapping aggregate
-        aa = aa[nonoverlap,:][:,nonoverlap]
+        if threshold is None:
+            levels[-1].threshold = max(0.1,((kappa/levels[-1].number_of_colors) - 1)/ levels[-1].multiplicity)
+            # levels[-1].threshold = max(0.1,((kappa/3) - 1)/levels[-1].multiplicity)
+        else:
+            levels[-1].threshold = threshold
+        p_r = []
+        p_c = []
+        p_v = []
+        counter = 0
+        levels[-1].min_ev = 1e12
 
-        # Schur complement of outer product in nonoverlapping subdomain
-        S = bb[nonoverlap,:][:,nonoverlap] - bb[nonoverlap,:][:,overlap] @ \
-            np.linalg.inv(bb[overlap,:][:,overlap]) @ bb[overlap,:][:,nonoverlap]
 
-        # When possible only compute necessary eigenvalues/vectors
-        try:
-            if max_ev != S.shape[0] and max_ev > 0:
-                E, V = eigh(aa,S,subset_by_index=[S.shape[0]-max_ev,S.shape[0]-1])
-            elif max_ev > 0:
-                E, V = eigh(aa,S)
-        except:
-            import pdb
-            pdb.set_trace()
+    # ---------------------------------------------------
+    # --- Solve local generalized eigenvalue problems ---
+    # ---------------------------------------------------
+    with stats.timeit("gep"):
+        for i in range(levels[-1].N):
 
-        if this_nev is not None and this_nev > 0:
-            # NOTE : assumes eigenvalues in increasing order
-            E = E[-this_nev:]
-            levels[-1].min_ev = min(levels[-1].min_ev, E[-this_nev])
-            V = V[:,-this_nev:]
-            levels[-1].nev[i] = this_nev
-            for j in range(len(E)):
-                temp_inds = np.arange(levels[-1].subdomain_ptr[i],levels[-1].subdomain_ptr[i + 1])[nonoverlap]
-                temp_rows = levels[-1].subdomain[temp_inds]
-                p_r.append(temp_rows)
-                p_c.append([counter]*len(temp_rows))
-                counter += 1
-                p_v.append(V[:,j])
-        elif max_ev > 0:
-            counter_nev = 0
-            # NOTE : assumes eigenvalues in increasing order
-            for j in range(len(E)-1,len(E)-np.min([len(E),max_ev])-1,-1):
-                if E[j] > levels[-1].threshold:
+            # Separate overlapping and nonoverlapping local DOFs
+            nonoverlap = np.where(levels[-1].PoU[i] == 1)[0]
+            overlap = np.where(levels[-1].PoU[i] == 0)[0]
+
+            # Overlapping subdomain matrix from local outer product of B, B^T
+            b = levels[-1].auxiliary[levels[-1].submatrices_ptr[i]:levels[-1].submatrices_ptr[i+1]]
+            bb = np.reshape(b,(int(np.sqrt(len(b))),int(np.sqrt(len(b)))))
+
+            # Local principle submatrix of overlapping subdomain
+            a = levels[-1].submatrices[levels[-1].submatrices_ptr[i]:levels[-1].submatrices_ptr[i+1]]
+            aa = np.reshape(a,(int(np.sqrt(len(a))),int(np.sqrt(len(a)))))
+
+            # Regularization
+            normbb = np.linalg.norm(bb, ord=2)
+            bb = bb + np.eye(bb.shape[0]) * (1e-10*normbb)
+
+            # Enforce minimum coarsening ratio on per aggregate basis
+            max_ev = aa.shape[0]
+            this_nev = nev
+            if min_coarsening is not None:
+                max_ev = len(levels[-1].nonoverlapping_subdomain[i])//min_coarsening
+            if nev is not None and min_coarsening is not None:
+                this_nev = np.min([nev,max_ev])
+
+            # Local principle submatrix restricted to nonoverlapping aggregate
+            aa = aa[nonoverlap,:][:,nonoverlap]
+
+            # Schur complement of outer product in nonoverlapping subdomain
+            S = bb[nonoverlap,:][:,nonoverlap] - bb[nonoverlap,:][:,overlap] @ \
+                np.linalg.inv(bb[overlap,:][:,overlap]) @ bb[overlap,:][:,nonoverlap]
+
+            # When possible only compute necessary eigenvalues/vectors
+            try:
+                if max_ev != S.shape[0] and max_ev > 0:
+                    E, V = eigh(aa,S,subset_by_index=[S.shape[0]-max_ev,S.shape[0]-1])
+                elif max_ev > 0:
+                    E, V = eigh(aa,S)
+            except:
+                import pdb
+                pdb.set_trace()
+
+            if this_nev is not None and this_nev > 0:
+                # NOTE : assumes eigenvalues in increasing order
+                E = E[-this_nev:]
+                levels[-1].min_ev = min(levels[-1].min_ev, E[-this_nev])
+                V = V[:,-this_nev:]
+                levels[-1].nev[i] = this_nev
+                for j in range(len(E)):
                     temp_inds = np.arange(levels[-1].subdomain_ptr[i],levels[-1].subdomain_ptr[i + 1])[nonoverlap]
                     temp_rows = levels[-1].subdomain[temp_inds]
-                    counter_nev += 1
-                    levels[-1].min_ev = min(levels[-1].min_ev, E[j])
                     p_r.append(temp_rows)
                     p_c.append([counter]*len(temp_rows))
                     counter += 1
                     p_v.append(V[:,j])
-            levels[-1].nev[i] = counter_nev
+            elif max_ev > 0:
+                counter_nev = 0
+                # NOTE : assumes eigenvalues in increasing order
+                for j in range(len(E)-1,len(E)-np.min([len(E),max_ev])-1,-1):
+                    if E[j] > levels[-1].threshold:
+                        temp_inds = np.arange(levels[-1].subdomain_ptr[i],levels[-1].subdomain_ptr[i + 1])[nonoverlap]
+                        temp_rows = levels[-1].subdomain[temp_inds]
+                        counter_nev += 1
+                        levels[-1].min_ev = min(levels[-1].min_ev, E[j])
+                        p_r.append(temp_rows)
+                        p_c.append([counter]*len(temp_rows))
+                        counter += 1
+                        p_v.append(V[:,j])
+                levels[-1].nev[i] = counter_nev
 
-    if(len(p_r)) == 0:
-        p_r = [[0]]
-        p_c = [[0]]
-        p_v = [[1]]
-        counter = 1
-    p_r = np.concatenate(p_r, dtype=np.int32)
-    p_c = np.concatenate(p_c, dtype=np.int32)
-    p_v = np.concatenate(p_v, dtype=np.float64)
-    levels[-1].P = csr_array((p_v, (p_r, p_c)), shape=(A.shape[0], counter))
-    levels[-1].R = levels[-1].P.T.conjugate().tocsr()
+    # ----------------------------------------------
+    # --- Assemble P from the local eigenvectors ---
+    # ----------------------------------------------
+    with stats.timeit("assemble_P"):
+        if(len(p_r)) == 0:
+            p_r = [[0]]
+            p_c = [[0]]
+            p_v = [[1]]
+            counter = 1
+        p_r = np.concatenate(p_r, dtype=np.int32)
+        p_c = np.concatenate(p_c, dtype=np.int32)
+        p_v = np.concatenate(p_v, dtype=np.float64)
+        levels[-1].P = csr_array((p_v, (p_r, p_c)), shape=(A.shape[0], counter))
+        levels[-1].R = levels[-1].P.T.conjugate().tocsr()
 
-    t1 = time.perf_counter()
+    # -------------------------------------------
+    # --- Form coarse grid operator A = R A P ---
+    # -------------------------------------------
+    with stats.timeit("coarsen"):
+        B = B @ levels[-1].P
+        BT = levels[-1].R @ BT
+        A = BT @ B
+        A.sort_indices()    # THIS IS IMPORTANT
+
     if print_info:
-        print("\tConstruct P time = {:.4g}".format(t1 - t0))
-
-    t0 = time.perf_counter()
-    B = B @ levels[-1].P
-    BT = levels[-1].R @ BT
-    A = BT @ B
-    A.sort_indices()    # THIS IS IMPORTANT
-
-    t1 = time.perf_counter()
-    if print_info:
-        print("\tP^TAP time = {:.4g}".format(t1 - t0))
         print("\tAggregate size = {:.3g}".format(AggOp.shape[0]/AggOp.shape[1]))
         print("\tEigenvectors/agg = {:.3g}".format(np.mean(levels[-1].nev)))
         print("\tCoarsening ratio = {:.3g}".format(levels[-1].A.shape[0]/A.shape[0]))
+
+    _lsdd_print_level_summary(stats, print_info=print_info)
 
     levels.append(MultilevelSolver.Level())
     levels[-1].A = A
     levels[-1].B = B
     levels[-1].BT = BT
     levels[-1].density = len(levels[-1].A.data) / (levels[-1].A.shape[0] ** 2)
+
+    
+
 
   
 def _remove_empty_columns(A):
