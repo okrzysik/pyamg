@@ -29,7 +29,7 @@ import pdb
 import time
 
 
-def least_squares_dd_solver(B, BT=None, A=None,
+def least_squares_dd_solver_exp(B, BT=None, A=None,
                             presmoother="ras",
                             postsmoother="rasT",
                             symmetry='hermitian', 
