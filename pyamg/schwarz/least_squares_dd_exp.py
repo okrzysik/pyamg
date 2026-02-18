@@ -1,6 +1,8 @@
 """Spectral Domain Decomposition - Least Squares.
 
 Copied from least_squares_dd.py at commit ba9bfe81d645dd94739fc36604779eb70ff608da
+
+ruff check least_squares_dd_exp.py --select F,E9
 """
 
 
@@ -8,14 +10,12 @@ from warnings import warn
 import numpy as np
 from scipy.sparse import csr_array, issparse, \
     SparseEfficiencyWarning, coo_array, csc_array, hstack
-from scipy.linalg import eig, eigh
-from copy import deepcopy
+from scipy.linalg import eigh
 
 from pyamg.multilevel import MultilevelSolver
 from pyamg.relaxation.smoothing import change_smoothers
-from pyamg.util.utils import eliminate_diag_dom_nodes, get_blocksize, asfptype, \
-    levelize_strength_or_aggregation, levelize_smooth_or_improve_candidates, \
-    levelize_weight, filter_matrix_rows
+from pyamg.util.utils import asfptype, \
+    levelize_strength_or_aggregation, levelize_weight, filter_matrix_rows
 from pyamg.strength import classical_strength_of_connection, \
     symmetric_strength_of_connection, evolution_strength_of_connection, \
     energy_based_strength_of_connection, distance_strength_of_connection, \
@@ -25,8 +25,10 @@ from pyamg.aggregation.aggregate import standard_aggregation, naive_aggregation,
     metis_aggregation, pairwise_aggregation
 from pyamg import amg_core
 
-import pdb
 import time
+
+
+
 
 
 def least_squares_dd_solver_exp(B, BT=None, A=None,
@@ -173,7 +175,7 @@ def least_squares_dd_solver_exp(B, BT=None, A=None,
             sm2 = ('rest_additive_schwarzT', {'subdomain': levels[-2].subdomain,\
                 'subdomain_ptr': levels[-2].subdomain_ptr,
                 'POU': levels[-2].PoU_flat, 'iterations':1})
-        elif postsmooth == None:
+        elif postsmoother == None:
             sm2 = None
         else:
             raise ValueError("Invalid smoother type.")
@@ -247,7 +249,7 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
         C = symmetric_strength_of_connection(A, **kwargs)
     elif fn == 'classical':
         C = classical_strength_of_connection(A, **kwargs)
-        test = abs(A).tocsr()
+        # test = abs(A).tocsr()
         # if (np.max(test.indptr-C.indptr) != 0) or (np.max(test.indices-C.indices) != 0):
         #     import pdb; pdb.set_trace()
     elif fn == 'distance':
@@ -300,7 +302,7 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
             if(len(levels) == 1):
                 AggOp = metis_aggregation(C, **kwargs)
             else:
-                ratio = levels[-2].N/16/levels[-1].A.shape[0]
+                #ratio = levels[-2].N/16/levels[-1].A.shape[0]
                 # ratio = max(levels[-2].nev)*4/levels[-1].A.shape[0]
                 # AggOp = metis_aggregation(C, ratio=ratio)
                 AggOp = metis_aggregation(C, **kwargs)
