@@ -96,7 +96,7 @@ def _lsdd_print_level_summary(stats: LsddLevelStats, *, print_info: bool, prefix
             "strength",
             "aggregate",
             "overlap",
-            "extract_A",
+            "extract_PCM",
             "outerprod",
             "gep",
             "assemble_P",
@@ -300,6 +300,7 @@ def _lsdd_process_one_aggregate_gep(
     p_r: list,
     p_c: list,
     p_v: list,
+    eigvals_kept: list | None = None,
 ) -> int:
     """Process one aggregate's local generalized EVP and append selected vectors to P triplets.
 
@@ -387,6 +388,8 @@ def _lsdd_process_one_aggregate_gep(
     if this_nev is not None and this_nev > 0:
         # NOTE: assumes eigenvalues in increasing order
         E = E[-this_nev:]
+        if eigvals_kept is not None:
+            eigvals_kept.extend(E.tolist())
         level.min_ev = min(level.min_ev, E[-this_nev])
         V = V[:, -this_nev:]
         level.nev[i] = this_nev
@@ -399,9 +402,11 @@ def _lsdd_process_one_aggregate_gep(
 
     elif max_ev > 0:
         counter_nev = 0
+        kept_here = []
         # NOTE: assumes eigenvalues in increasing order
         for j in range(len(E) - 1, len(E) - np.min([len(E), max_ev]) - 1, -1):
             if E[j] > level.threshold:
+                kept_here.append(E[j]) 
                 counter_nev += 1
                 level.min_ev = min(level.min_ev, E[j])
                 p_r.append(temp_rows)
@@ -409,6 +414,9 @@ def _lsdd_process_one_aggregate_gep(
                 p_v.append(V[:, j])
                 counter += 1
         level.nev[i] = counter_nev
+
+        if eigvals_kept is not None:
+            eigvals_kept.extend(kept_here)
 
     return counter
 
@@ -522,7 +530,7 @@ def _lsdd_build_overlap_and_pou(
 def _lsdd_extract_local_principal_submatrices(*, level, A, blocksize):
     """Extract local principal submatrices A(Omega_i, Omega_i) for all aggregates i.
 
-    Refactor-only extraction of the existing "extract_A" block.
+    Refactor-only extraction of the existing "extract_PCM" block.
 
     Parameters
     ----------
@@ -703,6 +711,203 @@ def _lsdd_append_next_level(*, levels, A, B, BT):
     return nxt
 
 
+def _lsdd_unpack_arg(v):
+    """Return (fn, kwargs) for PyAMG-style args: either 'name' or ('name', {...})."""
+    if isinstance(v, tuple):
+        return v[0], v[1]
+    return v, {}
+
+
+def _lsdd_filter_ops_inplace(*, A, B, BT, filteringA, filteringB, print_info: bool) -> None:
+    """Optionally filter A/B/BT in-place (refactor-only extraction)."""
+    if (filteringB is not None) and (filteringB[1] != 0):
+        if print_info:
+            print("B NNZ before filtering", len(B.data))
+            print("BT NNZ before filtering", len(BT.data))
+        filter_matrix_rows(B, filteringB[1], diagonal=True, lump=filteringB[0])
+        filter_matrix_rows(BT, filteringB[1], diagonal=True, lump=filteringB[0])
+        if print_info:
+            print("B NNZ after filtering", len(B.data))
+            print("BT NNZ after filtering", len(BT.data))
+
+    if (filteringA is not None) and (filteringA[1] != 0):
+        if print_info:
+            print("A NNZ before filtering", len(A.data))
+        filter_matrix_rows(A, filteringA[1], diagonal=True, lump=filteringA[0])
+        if print_info:
+            print("A NNZ after filtering", len(A.data))
+
+
+def _lsdd_build_strength(*, A, B, strength_spec):
+    """Compute strength-of-connection matrix C from strength spec (refactor-only)."""
+    fn, kwargs = _lsdd_unpack_arg(strength_spec)
+
+    if fn == "symmetric":
+        C = symmetric_strength_of_connection(A, **kwargs)
+    elif fn == "classical":
+        C = classical_strength_of_connection(A, **kwargs)
+    elif fn == "distance":
+        C = distance_strength_of_connection(A, **kwargs)
+    elif fn in ("ode", "evolution"):
+        if "B" in kwargs:
+            C = evolution_strength_of_connection(A, **kwargs)
+        else:
+            C = evolution_strength_of_connection(A, B, **kwargs)
+    elif fn == "energy_based":
+        C = energy_based_strength_of_connection(A, **kwargs)
+    elif fn == "predefined":
+        C = kwargs["C"].tocsr()
+    elif fn == "algebraic_distance":
+        C = algebraic_distance(A, **kwargs)
+    elif fn == "affinity":
+        C = affinity_distance(A, **kwargs)
+    elif fn is None:
+        # Hussam's original implementation
+        C = abs(A.copy()).tocsr()
+    else:
+        raise ValueError(f"Unrecognized strength of connection method: {fn!s}")
+
+    return C
+
+
+def _lsdd_build_aggop(*, A, C, aggregate_spec, agg_levels: int, is_finest: bool):
+    """Build aggregation operator AggOp (refactor-only extraction)."""
+    fn, kwargs = _lsdd_unpack_arg(aggregate_spec)
+
+    C = C.tocsr()
+    C.eliminate_zeros()
+
+    Aggs = []
+    for _ in range(agg_levels):
+        if fn == "standard":
+            AggOp, _Cnodes = standard_aggregation(C, **kwargs)
+        elif fn == "d2C":
+            C = C @ C
+            AggOp, _Cnodes = standard_aggregation(C, **kwargs)
+        elif fn == "d3C":
+            C = C @ C @ C
+            AggOp, _Cnodes = standard_aggregation(C, **kwargs)
+        elif fn == "naive":
+            AggOp, _Cnodes = naive_aggregation(C, **kwargs)
+        elif fn == "lloyd":
+            AggOp, _Cnodes = lloyd_aggregation(C, **kwargs)
+        elif fn == "balanced lloyd":
+            if "pad" in kwargs:
+                kwargs["A"] = A
+            AggOp, _Cnodes = balanced_lloyd_aggregation(C, **kwargs)
+        elif fn == "metis":
+            C.data[:] = 1.0
+            # currently same call either way; keep is_finest hook for future tweaks
+            AggOp = metis_aggregation(C, **kwargs)
+        elif fn == "pairwise":
+            AggOp = pairwise_aggregation(A, **kwargs)[0]
+        elif fn == "predefined":
+            AggOp = kwargs["AggOp"].tocsr()
+        else:
+            raise ValueError(f"Unrecognized aggregation method {fn!s}")
+
+        Aggs.append(AggOp)
+        if len(Aggs) < agg_levels:
+            C = (AggOp.T @ C @ AggOp).tocsr()
+
+    # Product of agg_levels (matches your current logic)
+    AggOp = Aggs[0]
+    for j in range(1, agg_levels):
+        AggOp = AggOp @ Aggs[j]
+
+    nc_temp = AggOp.shape[1]
+    print("\tNum aggregates = {:.4g}".format(nc_temp))
+    print("\tAv. aggregate size = {:.4g}".format(AggOp.shape[0] / AggOp.shape[1]))
+
+    AggOp = _fill_unaggregated_by_neighbors(A, AggOp, make_singletons=True)
+
+    print("\tNum singletons = {:.4g}".format(AggOp.shape[1] - nc_temp))
+    return AggOp, nc_temp
+
+
+def _lsdd_init_level_after_aggregation(*, level, AggOp, A, B):
+    """Populate level aggregation fields + allocate per-aggregate storage (refactor-only)."""
+    level.AggOp = AggOp
+    level.AggOpT = AggOp.T.tocsr()
+    level.N = AggOp.shape[1]
+
+    level.nonoverlapping_subdomain = [None] * level.N
+    level.overlapping_subdomain = [None] * level.N
+    level.PoU = [None] * level.N
+    level.overlapping_rows = [None] * level.N
+
+    level.nIi = np.zeros(level.N, dtype=np.int32)
+    level.ni = np.zeros(level.N, dtype=np.int32)
+    level.nev = np.zeros(level.N, dtype=np.int32)
+
+    v_mult = np.zeros(AggOp.shape[0])
+    blocksize = np.zeros(level.N, dtype=np.int32)
+    v_row_mult = np.zeros(B.shape[0])
+
+    return v_mult, blocksize, v_row_mult
+
+
+def _lsdd_finalize_level_stats(
+    *,
+    stats: LsddLevelStats,
+    level,
+    blocksize,
+    eigvals_kept,
+    n_coarse: int,
+) -> None:
+    """Populate stats.{n_aggs,n_coarse,extra} from the current level's artifacts.
+
+    Refactor-only: computes diagnostics only.
+    """
+    stats.n_aggs = getattr(level, "N", None)
+    stats.n_coarse = int(n_coarse)
+
+    # Coarsening ratio (fine / coarse)
+    if n_coarse > 0:
+        stats.extra["cr"] = float(stats.n_fine / n_coarse)
+    else:
+        stats.extra["cr"] = float("inf")
+
+    # Aggregate size stats (ω)
+    if hasattr(level, "nIi"):
+        omega = np.asarray(level.nIi, dtype=float)
+        stats.extra["omega_mean"] = float(np.mean(omega))
+        stats.extra["omega_med"] = float(np.median(omega))
+        stats.extra["omega_max"] = int(np.max(omega))
+
+    # Overlap size stats (Ω)
+    if blocksize is not None:
+        Omega = np.asarray(blocksize, dtype=float)
+        stats.extra["Omega_mean"] = float(np.mean(Omega))
+        stats.extra["Omega_med"] = float(np.median(Omega))
+        stats.extra["Omega_max"] = int(np.max(Omega))
+
+    # Eigenvectors per aggregate
+    if hasattr(level, "nev"):
+        nev = np.asarray(level.nev, dtype=float)
+        stats.extra["nev_mean"] = float(np.mean(nev))
+        stats.extra["nev_med"] = float(np.median(nev))
+        stats.extra["nev_max"] = int(np.max(nev))
+
+    # Eigenvalue stats over *kept* eigenvalues (i.e., those used to form columns of P)
+    if eigvals_kept:
+        ev = np.asarray(eigvals_kept, dtype=float)
+        stats.extra["eig_min"] = float(np.min(ev))
+        stats.extra["eig_med"] = float(np.median(ev))
+        stats.extra["eig_mean"] = float(np.mean(ev))
+        stats.extra["eig_max"] = float(np.max(ev))
+
+    # Other useful scalars already tracked on the level
+    if hasattr(level, "threshold"):
+        stats.extra["thr"] = float(level.threshold)
+    if hasattr(level, "min_ev"):
+        stats.extra["min_ev"] = float(level.min_ev)
+
+    # Optional: stash stats on the level for later inspection/debug
+    level.lsdd_stats = stats
+
+
+
 def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
     kappa, nev, threshold, min_coarsening, filteringA, \
     filteringB, print_info):
@@ -713,11 +918,6 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
     smoothed_aggregation_solver.
 
     """
-    def unpack_arg(v):
-        if isinstance(v, tuple):
-            return v[0], v[1]
-        return v, {}
-
     A = levels[-1].A
     B = levels[-1].B
     BT = levels[-1].BT
@@ -730,139 +930,39 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
     # --- Filter operator ---
     # -----------------------
     if len(levels) > 1:
-        if (filteringB is not None) and (filteringB[1] != 0):
-            if print_info:
-                print("B NNZ before filtering", len(B.data))
-                print("BT NNZ before filtering", len(BT.data))
-            filter_matrix_rows(B, filteringB[1], diagonal=True, lump=filteringB[0])
-            filter_matrix_rows(BT, filteringB[1], diagonal=True, lump=filteringB[0])
-            if print_info:
-                print("B NNZ after filtering", len(B.data))
-                print("BT NNZ after filtering", len(BT.data))
-
-        if (filteringA is not None) and (filteringA[1] != 0):
-            if print_info:
-                print("A NNZ before filtering", len(A.data))
-            filter_matrix_rows(A, filteringA[1], diagonal=True, lump=filteringA[0])
-            if print_info:
-                print("B NNZ after filtering", len(B.data))
-
+        with stats.timeit("filter"):
+            _lsdd_filter_ops_inplace(
+                A=A,
+                B=B,
+                BT=BT,
+                filteringA=filteringA,
+                filteringB=filteringB,
+                print_info=print_info,
+            )
 
     # --------------------------------------
     # --- Compute strength of connection ---
     # --------------------------------------
     with stats.timeit("strength"):
-        # Compute the strength-of-connection matrix C, where larger
-        # C[i,j] denote stronger couplings between i and j.
-        fn, kwargs = unpack_arg(strength[len(levels)-1])
-        if fn == 'symmetric':
-            C = symmetric_strength_of_connection(A, **kwargs)
-        elif fn == 'classical':
-            C = classical_strength_of_connection(A, **kwargs)
-            # test = abs(A).tocsr()
-            # if (np.max(test.indptr-C.indptr) != 0) or (np.max(test.indices-C.indices) != 0):
-            #     import pdb; pdb.set_trace()
-        elif fn == 'distance':
-            C = distance_strength_of_connection(A, **kwargs)
-        elif fn in ('ode', 'evolution'):
-            if 'B' in kwargs:
-                C = evolution_strength_of_connection(A, **kwargs)
-            else:
-                C = evolution_strength_of_connection(A, B, **kwargs)
-        elif fn == 'energy_based':
-            C = energy_based_strength_of_connection(A, **kwargs)
-        elif fn == 'predefined':
-            C = kwargs['C'].tocsr()
-        elif fn == 'algebraic_distance':
-            C = algebraic_distance(A, **kwargs)
-        elif fn == 'affinity':
-            C = affinity_distance(A, **kwargs)
-        ### Hussam's original implementation
-        elif fn is None:
-            C = abs(A.copy()).tocsr()
-        else:
-            raise ValueError(f'Unrecognized strength of connection method: {fn!s}')
-
+        C = _lsdd_build_strength(A=A, B=B, strength_spec=strength[len(levels) - 1])
 
     # ----------------------------------------
     # --- Compute aggregation matrix AggOp ---
     # ----------------------------------------
     with stats.timeit("aggregate"):
-        # Compute the aggregation matrix AggOp (i.e., the nodal coarsening of A).
-        # AggOp is a boolean matrix, where the sparsity pattern for the k-th column
-        # denotes the fine-grid nodes agglomerated into k-th coarse-grid node.
-        fn, kwargs = unpack_arg(aggregate[len(levels)-1])
-        C.eliminate_zeros()
-        Cnodes = None
-        Aggs = []
-        for i in range(0,agg_levels):
-            if fn == 'standard':
-                AggOp, Cnodes = standard_aggregation(C, **kwargs)
-            elif fn == 'd2C':
-                C = C @ C
-                AggOp, Cnodes = standard_aggregation(C, **kwargs)
-            elif fn == 'd3C':
-                C = C @ C @ C
-                AggOp, Cnodes = standard_aggregation(C, **kwargs)
-            elif fn == 'naive':
-                AggOp, Cnodes = naive_aggregation(C, **kwargs)
-            elif fn == 'lloyd':
-                AggOp, Cnodes = lloyd_aggregation(C, **kwargs)
-            elif fn == 'balanced lloyd':
-                if 'pad' in kwargs:
-                    kwargs['A'] = A
-                AggOp, Cnodes = balanced_lloyd_aggregation(C, **kwargs)
-            elif fn == 'metis':
-                C.data[:] = 1.0
-                if(len(levels) == 1):
-                    AggOp = metis_aggregation(C, **kwargs)
-                else:
-                    #ratio = levels[-2].N/16/levels[-1].A.shape[0]
-                    # ratio = max(levels[-2].nev)*4/levels[-1].A.shape[0]
-                    # AggOp = metis_aggregation(C, ratio=ratio)
-                    AggOp = metis_aggregation(C, **kwargs)
-            elif fn == 'pairwise':
-                AggOp = pairwise_aggregation(A, **kwargs)[0]
-            elif fn == 'predefined':
-                AggOp = kwargs['AggOp'].tocsr()
-            else:
-                raise ValueError(f'Unrecognized aggregation method {fn!s}')
-
-            Aggs.append(AggOp)
-            if i < agg_levels-1:
-                C = (AggOp.T @ C @ AggOp).tocsr()
-
-        # Create aggregation matrix as product of levels
-        AggOp = Aggs[0]
-        for i in range(1,agg_levels):
-            AggOp = AggOp @ Aggs[i]
-
-        # AggOp = AggOp.tocsc()
-        # AggOp = _remove_empty_columns(AggOp)
-        # AggOp = _add_columns_containing_isolated_nodes(AggOp)
-        # AggOp = AggOp.tocsr()
-        nc_temp = AggOp.shape[1]
-        print("\tNum aggregates = {:.4g}".format(nc_temp))
-        print("\tAv. aggregate size = {:.4g}".format(AggOp.shape[0]/AggOp.shape[1]))
-        AggOp = _fill_unaggregated_by_neighbors(A, AggOp, make_singletons=True)
-        print("\tNum singletons = {:.4g}".format(AggOp.shape[1]-nc_temp))
-
-        levels[-1].AggOp = AggOp
-        levels[-1].AggOpT = AggOp.T.tocsr()
-        levels[-1].N = AggOp.shape[1]  # number of coarse grid points
-        levels[-1].nonoverlapping_subdomain = [None]*levels[-1].N
-        levels[-1].overlapping_subdomain = [None]*levels[-1].N
-        levels[-1].PoU = [None]*levels[-1].N
-        levels[-1].overlapping_rows = [None]*levels[-1].N
-        levels[-1].nIi = np.zeros(levels[-1].N, dtype=np.int32)
-        levels[-1].ni = np.zeros(levels[-1].N, dtype=np.int32)
-        levels[-1].nev = np.zeros(levels[-1].N, dtype=np.int32)
-        v_mult = np.zeros(AggOp.shape[0])
-        blocksize = np.zeros(levels[-1].N, dtype=np.int32)
-        v_row_mult = np.zeros(B.shape[0])
-        stats.n_aggs = levels[-1].N
-
-
+        AggOp, nc_temp = _lsdd_build_aggop(
+            A=A,
+            C=C,
+            aggregate_spec=aggregate[len(levels) - 1],
+            agg_levels=agg_levels,
+            is_finest=(len(levels) == 1),
+        )
+        v_mult, blocksize, v_row_mult = _lsdd_init_level_after_aggregation(
+            level=levels[-1],
+            AggOp=AggOp,
+            A=A,
+            B=B,
+        )
     
     # ----------------------------------------------------------
     # --- Form overlapping subdomains and partition of unity ---
@@ -878,11 +978,11 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
             blocksize=blocksize,
             print_info=print_info,
         )
-    
+
     # ---------------------------------------------------------------------
     # --- Extract local principle submatrices on overlapping subdomains ---
     # ---------------------------------------------------------------------
-    with stats.timeit("extract_A"):
+    with stats.timeit("extract_PCM"):
         _lsdd_extract_local_principal_submatrices(level=levels[-1], A=A, blocksize=blocksize)
 
     # -----------------------------------------------------------
@@ -902,6 +1002,7 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
     # --- Solve local generalized eigenvalue problems ---
     # ---------------------------------------------------
     with stats.timeit("gep"):
+        eigvals_kept = []
         level = levels[-1]
         for i in range(level.N):
             counter = _lsdd_process_one_aggregate_gep(
@@ -913,6 +1014,7 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
                 p_r=p_r,
                 p_c=p_c,
                 p_v=p_v,
+                eigvals_kept = eigvals_kept,
             )
 
     # ----------------------------------------------
@@ -934,12 +1036,18 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
     with stats.timeit("coarsen"):
         A, B, BT = _lsdd_coarsen_operators(B=B, BT=BT, P=levels[-1].P, R=levels[-1].R)
 
-
-    stats.n_coarse = A.shape[0]
-    stats.extra["mean_nev"] = float(np.mean(levels[-1].nev))
-    stats.extra["min_ev"] = float(levels[-1].min_ev)
-
+    # -------------------------------------------
+    # --- Append next level and print summary ---
+    # -------------------------------------------
     _lsdd_append_next_level(levels=levels, A=A, B=B, BT=BT)
+
+    _lsdd_finalize_level_stats(
+        stats=stats,
+        level=levels[-1],
+        blocksize=blocksize,
+        eigvals_kept=eigvals_kept,
+        n_coarse=A.shape[0],
+    )
     _lsdd_print_level_summary(stats, print_info=print_info)
 
 
