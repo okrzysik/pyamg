@@ -208,14 +208,33 @@ def change_smoothers(ml, presmoother, postsmoother):
         # get function handle
         setup_presmoother = _setup_call(fn1)
 
-        ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **kwargs1)
-
         # unpack postsmoother[i]
         fn2, kwargs2 = _unpack_arg(postsmoother[i])
         # get function handle
         setup_postsmoother = _setup_call(fn2)
 
-        ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **kwargs2)
+        s = getattr(ml.levels[i], "lsdd_stats", None)
+
+        if s is None:
+            ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **kwargs1)
+            ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **kwargs2)
+        else:
+            with s.timeit("presmoother_setup"):
+                ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **kwargs1)
+            with s.timeit("postsmoother_setup"):
+                ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **kwargs2)
+
+            prof = getattr(ml.levels[i].A, "schwarz_profile", None)
+            if prof is not None:
+                # put them into timings so they show up in your level timing table
+                for k in ("extract", "invert", "potrf", "potri", "symmetrize", "fallback_gelss", "total"):
+                    if k in prof:
+                        s.timings[f"ras_{k}"] = float(prof[k])
+                # and block stats into extras
+                for k in ("nblocks", "m_med", "m_max"):
+                    if k in prof:
+                        s.extra[f"ras_{k}"] = prof[k]
+
 
         # Check if symmetric smoothing scheme
         if 'iterations' in kwargs1:

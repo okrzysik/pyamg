@@ -11,6 +11,9 @@ from ..util.params import set_tol
 from ..util.linalg import norm
 from .. import amg_core
 
+import time
+
+
 
 def make_system(A, x, b, formats=None):
     """Return A,x,b suitable for relaxation or raise an exception.
@@ -1261,6 +1264,17 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
         else:
             return A.schwarz_parameters
 
+    t_total = time.perf_counter()
+    prof = {
+        "extract": 0.0,
+        "invert": 0.0,
+        "potrf": 0.0,
+        "potri": 0.0,
+        "symmetrize": 0.0,
+        "fallback_gelss": 0.0,
+    }
+
+
     # Default is to use the overlapping regions defined by A's sparsity pattern
     A.sort_indices()
     if subdomain is None or subdomain_ptr is None:
@@ -1269,6 +1283,7 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
 
     # Extract each subdomain's block from the matrix
     if inv_subblock is None or inv_subblock_ptr is None:
+        t0 = time.perf_counter()
         inv_subblock_ptr = np.zeros(subdomain_ptr.shape,
                                     dtype=A.indices.dtype)
         blocksize = subdomain_ptr[1:] - subdomain_ptr[:-1]
@@ -1279,21 +1294,60 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
         amg_core.extract_subblocks(A.indptr, A.indices, A.data, inv_subblock,
                                    inv_subblock_ptr, subdomain, subdomain_ptr,
                                    int(subdomain_ptr.shape[0]-1), A.shape[0])
+        prof["extract"] += time.perf_counter() - t0
         # Choose tolerance for which singular values are zero in *gelss below
         cond = set_tol(A.dtype)
 
-        # Invert each block column
-        my_pinv, = la.get_lapack_funcs(['gelss'],
-                                       (np.ones((1,), dtype=A.dtype)))
-        for i in range(subdomain_ptr.shape[0]-1):
+        # Invert each block column using SVD
+        my_pinv, = la.get_lapack_funcs(['gelss'], (np.ones((1,), dtype=A.dtype))) 
+        # If SPD, use Cholesky factorization and inversion instead of SVD for better performance
+        use_chol = getattr(A, "is_spd", False) is True
+        if use_chol: 
+            potrf, potri = la.get_lapack_funcs(['potrf', 'potri'], (np.ones((1,), dtype=A.dtype),)) 
+
+        t0 = time.perf_counter()
+        for i in range(subdomain_ptr.shape[0] - 1):
             m = blocksize[i]
-            rhs = np.eye(m, m, dtype=A.dtype)
             j0 = inv_subblock_ptr[i]
-            j1 = inv_subblock_ptr[i+1]
-            gelssoutput = my_pinv(inv_subblock[j0:j1].reshape(m, m),
-                                  rhs, cond=cond, overwrite_a=True,
-                                  overwrite_b=True)
+            j1 = inv_subblock_ptr[i + 1]
+            Ablk = inv_subblock[j0:j1].reshape(m, m)
+
+            if use_chol:
+                tb = time.perf_counter()
+                c, info = potrf(Ablk, lower=False, overwrite_a=False, clean=True)
+                prof["potrf"] += time.perf_counter() - tb
+                if info == 0:
+                    # print(f"Cholesky factorization of block {i} succeeded, inverting...") <-- this print statement triggers, yet potrf time doesn't go up?
+                    tb = time.perf_counter()
+                    invU, info2 = potri(c, lower=False, overwrite_c=True)
+                    prof["potri"] += time.perf_counter() - tb
+                    if info2 == 0:
+                        tb = time.perf_counter()
+                        inv_full = np.triu(invU)
+                        inv_full += np.triu(inv_full, 1).T.conj()
+                        inv_subblock[j0:j1] = inv_full.ravel()
+                        prof["symmetrize"] += time.perf_counter() - tb
+                        continue
+                    else:
+                        print(f"Block {i} Cholesky inversion failed with info2={info2}, falling back to gelss.")
+                else:
+                    print(f"Block {i} Cholesky failed with info={info}, falling back to gelss.")
+
+            tb = time.perf_counter()
+            rhs = np.eye(m, m, dtype=A.dtype)
+            gelssoutput = my_pinv(Ablk, rhs, cond=cond, overwrite_a=True, overwrite_b=True)
             inv_subblock[j0:j1] = np.ravel(gelssoutput[1])
+            prof["fallback_gelss"] += time.perf_counter() - tb
+            
+
+        prof["invert"] += time.perf_counter() - t0
+
+    prof["total"] = time.perf_counter() - t_total
+    prof["nblocks"] = int(subdomain_ptr.shape[0] - 1)
+    prof["m_med"] = float(np.median(blocksize))
+    prof["m_max"] = float(np.max(blocksize))
+
+    A.schwarz_profile = prof
 
     A.schwarz_parameters = (subdomain, subdomain_ptr, inv_subblock,
                             inv_subblock_ptr)
