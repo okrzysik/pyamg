@@ -32,7 +32,7 @@ import time
 def least_squares_dd_solver_exp(B, BT=None, A=None,
                             presmoother="ras",
                             postsmoother="rasT",
-                            symmetry='hermitian', 
+                            symmetry='symmetric', 
                             strength=None,
                             aggregate='standard',
                             agg_levels=1,
@@ -93,10 +93,12 @@ def least_squares_dd_solver_exp(B, BT=None, A=None,
     A.eliminate_zeros()
     A.sort_indices()    # THIS IS IMPORTANT
     
-    if symmetry not in ('symmetric', 'hermitian', 'nonsymmetric'):
-        raise ValueError('Expected "symmetric", "nonsymmetric" or "hermitian" '
-                         'for the symmetry parameter ')
+    if symmetry not in ('symmetric', 'hermitian'):
+        raise ValueError('Expected "symmetric" or "hermitian" for the symmetry parameter ')
     A.symmetry = symmetry
+    
+    # Set "is_spd" flag to trigger Cholesky-based inversion of Schwarz blocks in the presmoother
+    A.is_spd = True
 
     if A.shape[0] != A.shape[1]:
         raise ValueError('expected square matrix')
@@ -326,14 +328,20 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
     # -------------------------------------------
     # --- Form coarse grid operator A = R A P ---
     # -------------------------------------------
+    fine_sym = getattr(levels[-1].A, "symmetry", None)
+    fine_is_spd = getattr(levels[-1].A, "is_spd", None)
     with stats.timeit("coarsen"):
         A, B, BT = _lsdd_coarsen_operators(B=B, BT=BT, P=levels[-1].P, R=levels[-1].R)
 
-    # -------------------------------------------
-    # --- Append next level and print summary ---
-    # -------------------------------------------
-    _lsdd_append_next_level(levels=levels, A=A, B=B, BT=BT)
+        # Propagate symmetry metadata (SciPy drops custom attrs on matmul)
+        if fine_sym is not None:
+            A.symmetry = fine_sym
+        if fine_is_spd is not None:
+            A.is_spd = fine_is_spd
 
+    # ------------------------------------------    --
+    # --- Finalize stats and append next level ---
+    # --------------------------------------------
     _lsdd_finalize_level_stats(
         stats=stats,
         level=levels[-1],
@@ -342,6 +350,8 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
         n_coarse=A.shape[0],
     )
     _lsdd_print_level_summary(stats, print_info=print_info)
+
+    _lsdd_append_next_level(levels=levels, A=A, B=B, BT=BT)
 
 
     

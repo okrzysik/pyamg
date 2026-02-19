@@ -322,10 +322,10 @@ def _extend_hierarchy(levels, strength, aggregate, agg_levels,\
     # AggOp = _add_columns_containing_isolated_nodes(AggOp)
     # AggOp = AggOp.tocsr()
     nc_temp = AggOp.shape[1]
-    print("\tNum aggregates = {:.4g}".format(nc_temp))
-    print("\tAv. aggregate size = {:.4g}".format(AggOp.shape[0]/AggOp.shape[1]))
+    #print("\tNum aggregates = {:.4g}".format(nc_temp))
+    #print("\tAv. aggregate size = {:.4g}".format(AggOp.shape[0]/AggOp.shape[1]))
     AggOp = _fill_unaggregated_by_neighbors(A, AggOp, make_singletons=True)
-    print("\tNum singletons = {:.4g}".format(AggOp.shape[1]-nc_temp))
+    #print("\tNum singletons = {:.4g}".format(AggOp.shape[1]-nc_temp))
 
     levels[-1].AggOp = AggOp
     levels[-1].AggOpT = AggOp.T.tocsr()

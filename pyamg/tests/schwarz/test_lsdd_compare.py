@@ -101,7 +101,7 @@ def _run_one(
         A=A,
         symmetry="hermitian",
         aggregate=aggregate,
-        agg_levels=1,
+        agg_levels=2,
         presmoother="ras",
         postsmoother="rasT",
         kappa=50,

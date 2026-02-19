@@ -209,12 +209,12 @@ def _lsdd_build_aggop(*, A, C, aggregate_spec, agg_levels: int, is_finest: bool)
         AggOp = AggOp @ Aggs[j]
 
     nc_temp = AggOp.shape[1]
-    print("\tNum aggregates = {:.4g}".format(nc_temp))
-    print("\tAv. aggregate size = {:.4g}".format(AggOp.shape[0] / AggOp.shape[1]))
+    #print("\tNum aggregates = {:.4g}".format(nc_temp))
+    #print("\tAv. aggregate size = {:.4g}".format(AggOp.shape[0] / AggOp.shape[1]))
 
     AggOp = _fill_unaggregated_by_neighbors(A, AggOp, make_singletons=True)
 
-    print("\tNum singletons = {:.4g}".format(AggOp.shape[1] - nc_temp))
+    #print("\tNum singletons = {:.4g}".format(AggOp.shape[1] - nc_temp))
     return AggOp, nc_temp
 
 

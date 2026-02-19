@@ -1271,7 +1271,7 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
         "potrf": 0.0,
         "potri": 0.0,
         "symmetrize": 0.0,
-        "fallback_gelss": 0.0,
+        "gelss": 0.0,
     }
 
 
@@ -1295,7 +1295,7 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
                                    inv_subblock_ptr, subdomain, subdomain_ptr,
                                    int(subdomain_ptr.shape[0]-1), A.shape[0])
         prof["extract"] += time.perf_counter() - t0
-        # Choose tolerance for which singular values are zero in *gelss below
+        
         cond = set_tol(A.dtype)
 
         # Invert each block column using SVD
@@ -1314,10 +1314,10 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
 
             if use_chol:
                 tb = time.perf_counter()
+                # Compute Cholesky factorization of the block
                 c, info = potrf(Ablk, lower=False, overwrite_a=False, clean=True)
                 prof["potrf"] += time.perf_counter() - tb
                 if info == 0:
-                    # print(f"Cholesky factorization of block {i} succeeded, inverting...") <-- this print statement triggers, yet potrf time doesn't go up?
                     tb = time.perf_counter()
                     invU, info2 = potri(c, lower=False, overwrite_c=True)
                     prof["potri"] += time.perf_counter() - tb
@@ -1337,16 +1337,16 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
             rhs = np.eye(m, m, dtype=A.dtype)
             gelssoutput = my_pinv(Ablk, rhs, cond=cond, overwrite_a=True, overwrite_b=True)
             inv_subblock[j0:j1] = np.ravel(gelssoutput[1])
-            prof["fallback_gelss"] += time.perf_counter() - tb
+            prof["gelss"] += time.perf_counter() - tb
             
 
         prof["invert"] += time.perf_counter() - t0
 
     prof["total"] = time.perf_counter() - t_total
     prof["nblocks"] = int(subdomain_ptr.shape[0] - 1)
-    prof["m_med"] = float(np.median(blocksize))
-    prof["m_max"] = float(np.max(blocksize))
-
+    prof["min"] = int(np.min(blocksize))
+    prof["med"] = float(np.median(blocksize))
+    prof["max"] = int(np.max(blocksize))
     A.schwarz_profile = prof
 
     A.schwarz_parameters = (subdomain, subdomain_ptr, inv_subblock,

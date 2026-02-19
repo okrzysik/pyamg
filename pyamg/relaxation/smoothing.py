@@ -219,19 +219,20 @@ def change_smoothers(ml, presmoother, postsmoother):
             ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **kwargs1)
             ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **kwargs2)
         else:
-            with s.timeit("presmoother_setup"):
+            with s.timeit("prerel_stp"):
                 ml.levels[i].presmoother = setup_presmoother(ml.levels[i], **kwargs1)
-            with s.timeit("postsmoother_setup"):
+            with s.timeit("pstrel_stp"):
                 ml.levels[i].postsmoother = setup_postsmoother(ml.levels[i], **kwargs2)
 
+            # Extract Schwarz profile information if available and put it into the level's stats
             prof = getattr(ml.levels[i].A, "schwarz_profile", None)
             if prof is not None:
                 # put them into timings so they show up in your level timing table
-                for k in ("extract", "invert", "potrf", "potri", "symmetrize", "fallback_gelss", "total"):
+                for k in ("extract", "invert", "potrf", "potri", "symmetrize", "gelss", "total"):
                     if k in prof:
                         s.timings[f"ras_{k}"] = float(prof[k])
                 # and block stats into extras
-                for k in ("nblocks", "m_med", "m_max"):
+                for k in ("nblocks", "min", "med", "max"):
                     if k in prof:
                         s.extra[f"ras_{k}"] = prof[k]
 
