@@ -29,6 +29,29 @@ from .types import SparseLike
 from pyamg.multilevel import MultilevelSolver
 
 
+def _lsdd_density(A) -> float:
+    """Return operator density nnz / n^2 as a float."""
+    n = int(A.shape[0])
+    if n <= 0:
+        return 0.0
+    return float(A.nnz) / float(n * n)
+
+
+def _lsdd_should_coarsen(*, n_levels: int, A, max_levels: int, max_coarse: int, max_density: float) -> bool:
+    """Return True iff we should attempt to coarsen the current last level.
+
+    This matches the wrapper condition:
+        n_levels < max_levels and A.shape[0] > max_coarse and density(A) < max_density
+    """
+    if n_levels >= int(max_levels):
+        return False
+    if int(A.shape[0]) <= int(max_coarse):
+        return False
+    if _lsdd_density(A) >= float(max_density):
+        return False
+    return True
+
+
 def _lsdd_assemble_P_from_triplets(
     *,
     level: LSDDLevel,
@@ -88,7 +111,7 @@ def _lsdd_assemble_P_from_triplets(
     return counter
 
 
-def _lsdd_coarsen_operators(*, A: SparseLike, B: SparseLike, P: SparseLike, R: SparseLike, stats, levels, cfg) -> tuple[SparseLike, SparseLike, SparseLike]:
+def _lsdd_coarsen_operators(*, A: SparseLike, B: SparseLike, P: SparseLike, R: SparseLike, stats, levels: list[MultilevelSolver.Level], cfg: LSDDConfig) -> tuple[SparseLike, SparseLike | None]:
     """Form coarse operators for the next level.
 
     This routine always propagates the least-squares factor:
@@ -109,11 +132,10 @@ def _lsdd_coarsen_operators(*, A: SparseLike, B: SparseLike, P: SparseLike, R: S
 
     Returns
     -------
-    A_c, B_c, BT_c
+    A_c, B_c | None
         Coarse operators:
-          - B_c  = B @ P
           - A_c  = R @ A @ P
-          - BT_c = B_c.T (CSR/CSC depending on your storage convention)
+          - B_c  = B @ P, if the hierarchy will be extended further, else None.
 
     Notes
     -----
@@ -137,24 +159,25 @@ def _lsdd_coarsen_operators(*, A: SparseLike, B: SparseLike, P: SparseLike, R: S
     A_c.symmetry = getattr(A, "symmetry")
     A_c.schwarz_use_cholesky = True
 
-    # TODO(): There should be a simple function somewhere that returns true or false for whether this will be the last level or not, so that we're not duplicating the logic here.
-    # Decide whether the *new* level will be extended further.
-    # This matches the wrapper while-condition evaluated on the next iteration.
-    density_c = A_c.nnz / (A_c.shape[0] ** 2)
-    need_B_c = (
-        (len(levels) + 1) < cfg.max_levels
-        and A_c.shape[0] > cfg.max_coarse
-        and density_c < cfg.max_density
+    # Decide whether the *new* level associated with A_c will be the final level or not.
+    continue_coarsening = _lsdd_should_coarsen(
+        n_levels=len(levels) + 1, # the number of levels once level for A_c level is created
+        A=A_c,
+        max_levels=cfg.max_levels,
+        max_coarse=cfg.max_coarse,
+        max_density=cfg.max_density,
     )
 
-    B_c = None
-    if need_B_c:
+    # If we coarsen past A_c then we need a B_c
+    if continue_coarsening:
         with stats.timeit("coarsen_B_P"):
             B_c = B @ P_csc
 
         with stats.timeit("coarsen_sort"):
             B_c.sort_indices()
-
+    else:
+        B_c = None
+        
     return A_c, B_c
 
 
@@ -299,7 +322,6 @@ def _lsdd_extend_hierarchy(
     # ---- per-aggregate dense GEP ----
     eigvals_kept: list[float] = []
     gep_timers: dict[str, float] = {}  # accumulates sub-timers across all aggregates on this level
-
     with stats.timeit("gep"):
         for i in range(level.n_aggs):
             counter = _lsdd_process_one_aggregate_gep(
@@ -312,7 +334,7 @@ def _lsdd_extend_hierarchy(
                 p_c=p_c,
                 p_v=p_v,
                 eigvals_kept=eigvals_kept,
-                gep_timers=gep_timers,   # NEW
+                gep_timers=gep_timers,
             )
 
     # Record sub-timers for printing (do not include these in the overall "total" sum in stats.py)

@@ -25,7 +25,7 @@ from pyamg.util.utils import asfptype, \
     levelize_strength_or_aggregation, levelize_weight
 
 
-from .lsdd.hierarchy import _lsdd_extend_hierarchy
+from .lsdd.hierarchy import _lsdd_extend_hierarchy, _lsdd_should_coarsen
 from .lsdd.smoothers import lsdd_make_smoother_spec
 from .lsdd.types import FilteringSpec, SparseLike
 
@@ -193,15 +193,19 @@ def least_squares_dd_solver_exp(
     levels[-1].B = B          
     levels[-1].BT = BT        
     levels[-1].BT_provided = BT_provided
-    levels[-1].A_provided = A_provided
+    levels[-1].A_provided = A_provided # TODO: Why is this stored, and ditto for BT. I don't think they need to be, do they?
     levels[-1].density = len(levels[-1].A.data) / (levels[-1].A.shape[0] ** 2)
 
     lvl = 0
     pre_smooth = []
     post_smooth = []
-    while len(levels) < max_levels and \
-        levels[-1].A.shape[0] > max_coarse and \
-        levels[-1].density < max_density:
+    while _lsdd_should_coarsen(
+        n_levels=len(levels),
+        A=levels[-1].A,
+        max_levels=max_levels,
+        max_coarse=max_coarse,
+        max_density=max_density,
+    ):
         
         # Extend the hierarchy
         cfg = LSDDConfig(
