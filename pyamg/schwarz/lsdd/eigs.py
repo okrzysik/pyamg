@@ -30,7 +30,7 @@ from .types import LSDDLevel
 
 import numpy as np
 from scipy.linalg import eigh
-
+from time import perf_counter
 from scipy.linalg import cho_factor, cho_solve, LinAlgError
 
 
@@ -46,6 +46,7 @@ def _lsdd_process_one_aggregate_gep(
     p_c: list,
     p_v: list,
     eigvals_kept: list[float] | None = None,
+    gep_timers,
 ) -> int:
     """Solve aggregate i's local GEP and append selected vectors to P triplets.
 
@@ -108,6 +109,15 @@ def _lsdd_process_one_aggregate_gep(
     -----
     The SciPy routine `scipy.linalg.eigh` returns eigenvalues in nondecreasing order.
     """
+    # Optional: accumulate sub-timings (seconds) across aggregates into `gep_timers`.
+    # Expectation: `gep_timers` is a dict[str, float] (e.g. defaultdict(float)) or None.
+    def _tadd(key: str, dt: float) -> None:
+        if gep_timers is None:
+            return
+        gep_timers[key] = gep_timers.get(key, 0.0) + dt
+
+
+    t0 = perf_counter()
     pou = level.sub.PoU[i]
     omega = np.flatnonzero(pou == 1)
     GAMMA = np.flatnonzero(pou == 0)
@@ -129,7 +139,9 @@ def _lsdd_process_one_aggregate_gep(
     b_dim = int(np.sqrt(b_flat.size))
     aa_full = a_flat.reshape((a_dim, a_dim))
     bb_full = b_flat.reshape((b_dim, b_dim))
+    _tadd("gep_unpack", perf_counter() - t0)
 
+    t0 = perf_counter()
     # ---- regularize bb to avoid breakdowns in the Schur complement ----
     # Use a cheap scale; avoid spectral norm (ord=2) which is SVD-cost.
     bb_full = bb_full.copy()  # do not mutate the flattened storage
@@ -138,7 +150,9 @@ def _lsdd_process_one_aggregate_gep(
 
     # add eps*I without allocating an identity matrix
     bb_full.flat[:: bb_full.shape[0] + 1] += eps
+    _tadd("gep_regularize", perf_counter() - t0)
 
+    t0 = perf_counter()
     # ---- cap number of eigenpairs to keep (per aggregate) ----
     omega_size_global = int(level.sub.n_omega[i])
     max_keep = omega_size_global
@@ -154,7 +168,9 @@ def _lsdd_process_one_aggregate_gep(
         return counter
 
     max_keep = min(max_keep, aa.shape[0])
+    _tadd("gep_cap_and_restrict", perf_counter() - t0)
 
+    t0 = perf_counter()
     # ---- Schur complement of bb onto omega ----
     if GAMMA.size == 0:
         S = bb_full[np.ix_(omega, omega)]
@@ -169,15 +185,47 @@ def _lsdd_process_one_aggregate_gep(
             X = np.linalg.solve(bb_GG, bb_Go)
 
         S = bb_full[np.ix_(omega, omega)] - bb_full[np.ix_(omega, GAMMA)] @ X
+    _tadd("gep_schur", perf_counter() - t0)
 
-    # ---- solve GEP; optionally compute only the largest max_keep eigenpairs ----
-    if max_keep != S.shape[0]:
-        lo = S.shape[0] - max_keep
-        hi = S.shape[0] - 1
-        E, V = eigh(aa, S, subset_by_index=[lo, hi])
+    t0 = perf_counter()
+    # ---- solve GEP; compute only the eigenpairs we could possibly keep ----
+    # `eigh(aa, S)` returns eigenvalues in nondecreasing order.
+    # We select exactly one of:
+    #   - subset_by_index: keep only the largest k eigenpairs (best when k is known/capped)
+    #   - subset_by_value: keep only eigenpairs with lambda >= thr (best in threshold mode)
+    nloc = S.shape[0]
+    subset_kwargs: dict[str, object] = {}
+
+    # If nev is set, we will keep at most `nev` eigenvectors (also capped by max_keep).
+    if nev is not None:
+        k = int(min(max_keep, nev))
+        k = max(1, min(k, nloc))
+        if k < nloc:
+            lo = nloc - k
+            hi = nloc - 1
+            subset_kwargs["subset_by_index"] = [lo, hi]
+
+    # Otherwise we are in threshold-selection mode.
     else:
-        E, V = eigh(aa, S)
+        # If max_keep caps the number we could ever keep, subset by index is still best.
+        k = int(max_keep)
+        k = max(1, min(k, nloc))
+        if k < nloc:
+            lo = nloc - k
+            hi = nloc - 1
+            subset_kwargs["subset_by_index"] = [lo, hi]
+        else:
+            # No cap: try to avoid computing small eigenpairs below the threshold.
+            subset_kwargs["subset_by_value"] = [float(thr), float("inf")]
 
+    try:
+        E, V = eigh(aa, S, **subset_kwargs) if subset_kwargs else eigh(aa, S)
+    except TypeError:
+        # Older SciPy may not support subset selection -> fall back to full solve.
+        E, V = eigh(aa, S)
+    _tadd("gep_eigh", perf_counter() - t0)
+
+    t0 = perf_counter()
     # Map local omega indices -> global row indices for insertion into P
     idx0 = blocks.subdomain_ptr[i]
     idx1 = blocks.subdomain_ptr[i + 1]
@@ -186,9 +234,11 @@ def _lsdd_process_one_aggregate_gep(
 
     # Access threshold + per-aggregate nev array
     thr = float(level.eigs.threshold)
+    _tadd("gep_map_rows", perf_counter() - t0)
 
-    # ---- selection ----
+    # ---- selection + triplet insertion ----
     if nev is not None:
+        t0 = perf_counter()
         keep = min(int(nev), max_keep)
         if keep <= 0:
             return counter
@@ -196,15 +246,14 @@ def _lsdd_process_one_aggregate_gep(
         # E is increasing; keep the largest `keep`
         E_keep = E[-keep:]
         V_keep = V[:, -keep:]
+        _tadd("gep_select", perf_counter() - t0)
 
+        t0 = perf_counter()
         if eigvals_kept is not None:
             eigvals_kept.extend([float(x) for x in E_keep])
 
         # Track minimum kept eigenvalue across all aggregates
         min_kept = float(E_keep[0])
-        if hasattr(level, "eigs") and level.eigs is not None:
-            level.eigs.min_ev = min(level.eigs.min_ev, min_kept)
-            level.eigs.nev[i] = keep
         level.eigs.min_ev = min(level.eigs.min_ev, min_kept)
         level.eigs.nev[i] = keep
 
@@ -213,10 +262,12 @@ def _lsdd_process_one_aggregate_gep(
             p_c.append(np.full(global_rows.shape[0], counter, dtype=np.int32))
             p_v.append(V_keep[:, j])
             counter += 1
+        _tadd("gep_triplets", perf_counter() - t0)
 
         return counter
 
     # threshold-based selection from largest downwards
+    t0 = perf_counter()
     kept_count = 0
     kept_vals: list[float] = []
 
@@ -228,8 +279,6 @@ def _lsdd_process_one_aggregate_gep(
         kept_vals.append(ev)
         kept_count += 1
 
-        if hasattr(level, "eigs") and level.eigs is not None:
-            level.eigs.min_ev = min(level.eigs.min_ev, ev)
         level.eigs.min_ev = min(level.eigs.min_ev, ev)
 
         p_r.append(global_rows)
@@ -238,10 +287,9 @@ def _lsdd_process_one_aggregate_gep(
         counter += 1
 
     level.eigs.nev[i] = kept_count
-    if hasattr(level, "eigs") and level.eigs is not None:
-        level.eigs.nev[i] = kept_count
 
     if eigvals_kept is not None:
         eigvals_kept.extend(kept_vals)
 
+    _tadd("gep_triplets", perf_counter() - t0)
     return counter

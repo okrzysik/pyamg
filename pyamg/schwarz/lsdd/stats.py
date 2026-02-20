@@ -259,16 +259,26 @@ def _lsdd_print_level_summary(
     total = 0.0
     print(f"{indent}     timing:")
     for k in order:
+        if k in stats.timings:
+            v = stats.timings[k]
+            total += v
+            print(f"{indent}       {k:<11} {_fmt_ms(v)}")
+
+        # Print individual pieces for gep
+        if k == "gep":
+            sub = sorted(kk for kk in stats.timings if kk.startswith("gep_"))
+            for kk in sub:
+                # printed but not included in `total`
+                print(f"{indent}         {kk[4:]:<11} {_fmt_ms(stats.timings[kk])}")
+
+
+        # Print individual pieces for coarsening
         if k == "coarsen":
             sub = sorted(kk for kk in stats.timings if kk.startswith("coarsen_"))
             for kk in sub:
                 # printed but not included in `total`
                 print(f"{indent}         {kk[8:]:<11} {_fmt_ms(stats.timings[kk])}")
 
-        if k in stats.timings:
-            v = stats.timings[k]
-            total += v
-            print(f"{indent}       {k:<11} {_fmt_ms(v)}")
     print(f"{indent}       {'total':<11} {_fmt_ms(total)}")
 
 

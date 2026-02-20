@@ -27,6 +27,9 @@ Throughout, **every optimization must preserve correctness** (via tests) and sho
 
 ---
 
+## TODOs:
+-
+
 ## Optimization 1 — Form the coarse SPD operator via RAP: `A_c = R @ A @ P`
 
 ### What changed
@@ -111,6 +114,7 @@ replace it with alternative propagation (e.g. via `R @ BT`) was counterproductiv
 
 ## Optimization 5 — Adjacency for overlap construction: prefer `B_csc` over storing `BT`
 
+Since we do not compute 
 Overlap construction needs: for each column/DOF `j`, the set of B-rows touching `j`.
 This is **column adjacency** of `B`.
 
@@ -138,6 +142,9 @@ This is **column adjacency** of `B`.
   for overlap adjacency.
 - Do **not** build `B_csc` inside overlap hot loops (avoid Option C).
 
+
+- I'm not really convinced of the above. The cleanest thing seems to be to just create a local CSC copy of B in the outer-product routine... Timing was mixed on that, but not sure how it could really be worse, and it lessens out memory overhead and simplifies the code.
+
 ### Sorting
 - For adjacency (set unions), **sorted indices are not required**. Sorting can be skipped unless another routine depends on it.
 
@@ -157,6 +164,7 @@ This is **column adjacency** of `B`.
 ### 3) Build CSC inside overlap instead of caching per level
 - Result: overlap time increased substantially (conversion cost moved into a hot stage), worsening total setup.
 
+
 ---
 
 ## Practical “do this first” workflow for future performance work
@@ -175,3 +183,69 @@ At the current state (after the optimizations above), the large remaining hotspo
 
 Those require either more careful sparse-kernel handling (dtype/contiguity/pointer packing) or algorithmic changes (e.g. reducing
 the need to materialize `B` on intermediate levels).
+
+
+## GEP performance: where the time goes, what we tried, and next steps
+
+### What dominates runtime inside `gep`
+Instrumentation of the per-aggregate generalized eigenproblem (GEP) shows that the runtime is dominated by **dense linear algebra**,
+not Python bookkeeping:
+
+- The **`eigh` call** (dense generalized symmetric EVP) is the main cost on every level:
+  - Typical breakdown on `B_n263169`:
+    - level 0: `eigh ≈ 1.0s` out of `gep ≈ 1.6–1.7s`
+    - level 1: `eigh ≈ 1.25s` out of `gep ≈ 1.7s`
+    - level 2: `eigh ≈ 1.35–1.40s` out of `gep ≈ 1.6–1.7s`
+- The **Schur complement construction** (forming `S` on `omega` by eliminating `GAMMA`) is the clear #2 cost:
+  - `schur ≈ 0.22–0.37s` depending on level.
+- Everything else is second-order:
+  - `triplets` / list appends are small (tens of ms at most on level 0 and ~0 on deep levels), which matches the fact that
+    `assemble_P` is already small compared to `gep`.
+
+**Conclusion:** optimizing Python-side list building is not a meaningful lever for `gep`; we need to reduce or accelerate the dense
+`eigh` workload and/or the Schur complement work.
+
+### Attempts made (and why they didn’t move the needle)
+
+1) **Partial spectrum via subset selection (`subset_by_index` / `subset_by_value`)**
+- Idea: since we only keep a limited number of eigenvectors per aggregate (via `nev` and/or `max_keep`, or via a threshold),
+  request only the needed eigenpairs from SciPy:
+  - `subset_by_index=[nloc-k, nloc-1]` for the largest `k` eigenpairs.
+  - `subset_by_value=[thr, inf]` for threshold-mode selection.
+- Outcome: per-level `gep` timings were essentially unchanged in the benchmark configurations tested.
+- Likely reason: the selected `k` is often still large enough that the LAPACK work dominates, and/or the driver still performs
+  substantial work even when a subset is requested (implementation-dependent).
+
+- But. I also think that in the tests maybe nev was always being used rather than a threshold, such that the changed code never even executed.
+
+2) **Reduce SciPy/LAPACK overhead (`check_finite=False`, Fortran-contiguous inputs, overwrite flags)**
+- Idea: avoid hidden copies and input validation overhead in `eigh` by passing
+  `np.asfortranarray(...)`, `check_finite=False`, and `overwrite_a/b=True`.
+- Outcome: produced only a small improvement in some cases (e.g. modest reduction in `eigh` time on level 0), but did not change
+  the overall picture; dense EVP cost still dominates.
+
+### What could be tried next (future work)
+
+1) **Parallelize per-aggregate GEP solves (best candidate if GEP remains a major bottleneck)**
+- Each aggregate GEP is independent, so the loop over aggregates is embarrassingly parallel.
+- Caveat: SciPy/LAPACK may already be multi-threaded (OpenBLAS/MKL). Parallelizing aggregates without controlling BLAS threads can
+  cause oversubscription and slowdowns. Any threaded aggregate-parallel approach should cap BLAS threads to 1 during the region
+  (e.g. via `threadpoolctl`).
+- Implementation note: parallelism requires a two-pass assembly:
+  1) compute per-aggregate results in parallel (kept eigenvectors + row indices),
+  2) serial prefix-sum to assign global column indices and assemble `P` deterministically.
+
+2) **Reduce Schur-complement cost**
+- The Schur step is the second largest component and includes dense solves on `bb_GG`.
+- Potential avenues:
+  - reuse factorizations when possible (if repeated structure occurs),
+  - reduce `GAMMA` size by tuning overlap construction (algorithmically sensitive),
+  - ensure `bb_GG` operations use Cholesky fast paths consistently (already done in many cases).
+
+3) **Alternative dense EVP strategies**
+- Depending on SciPy/LAPACK backend, different drivers or formulations may be faster (still same math, different kernel).
+- If we eventually accept a larger change, one can explore converting the generalized EVP into a standard EVP via Cholesky of `S`
+  (when stable) and calling a faster standard symmetric eigensolver; this is more delicate numerically and should be guarded.
+
+Overall takeaway: the GEP hotspot is a **dense-LAPACK cost**, so meaningful wins are expected from **parallelism or better dense
+kernels**, not from Python-level micro-optimizations.

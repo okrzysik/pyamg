@@ -61,6 +61,7 @@ def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, B, v_row_mult: np.ndarra
     # if hasattr(B_csc, "sort_indices") and not B_csc.has_sorted_indices:
     #     B_csc.sort_indices()
 
+    # Originally this function took in BT in CSR form and sliced rows of BT to define R_rows_i.
     # B_csc = B.T.tocsr() # == BT that was originally used here...
     # B_csc.sort_indices()  # ensure sorted for efficient slicing
 

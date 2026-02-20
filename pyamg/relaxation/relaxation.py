@@ -1253,6 +1253,7 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
     A.schwarz_parameters[3] is inv_subblock_ptr
 
     """
+
     # Check if A has a pre-existing set of Schwarz parameters
     if hasattr(A, 'schwarz_parameters'):
         if subdomain is not None and subdomain_ptr is not None:
@@ -1273,7 +1274,6 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
         "symmetrize": 0.0,
         "gelss": 0.0,
     }
-
 
     # Default is to use the overlapping regions defined by A's sparsity pattern
     A.sort_indices()
@@ -1300,10 +1300,12 @@ def schwarz_parameters(A, subdomain=None, subdomain_ptr=None,
 
         # Invert each block column using SVD
         my_pinv, = la.get_lapack_funcs(['gelss'], (np.ones((1,), dtype=A.dtype))) 
-        # If SPD, use Cholesky factorization and inversion instead of SVD for better performance
-        use_chol = getattr(A, "is_spd", False) is True
+        # Attempt to use Cholesky factorization and inversion instead of SVD for better performance; this requires the user to have attached a "schwarz_use_cholesky" attribute to the matrix A with value True
+        use_chol = getattr(A, "schwarz_use_cholesky", False) is True
         if use_chol: 
             potrf, potri = la.get_lapack_funcs(['potrf', 'potri'], (np.ones((1,), dtype=A.dtype),)) 
+
+        # print(f"\tUsing {'Cholesky' if use_chol else 'SVD'} for block inversion in Schwarz relaxation.")
 
         t0 = time.perf_counter()
         for i in range(subdomain_ptr.shape[0] - 1):

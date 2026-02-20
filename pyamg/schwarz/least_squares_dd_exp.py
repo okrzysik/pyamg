@@ -147,10 +147,15 @@ def least_squares_dd_solver_exp(
     B = asfptype(B)
     BT = asfptype(BT)
 
+    # Construct A as BT @ B if A not provided
     if A is None:
         A = BT @ B
-        A.tocsr()
-        A.sort_indices()
+
+    # If A provided, make a private working copy to ensure we can safely mutate metadata and do in-place operations (e.g., we attach Schwarz-parameter meta-data our A, and it's vital that this not be confused with existing Schwarz meta data on A. Moreover the efficient construction of this Schwarz metadata relies on being able to reliably attach meta data to A).
+    else:
+        A_in = A
+        A = A_in.copy()
+
     A = asfptype(A)
     A = A.tocsr()
     A.eliminate_zeros()
@@ -160,8 +165,8 @@ def least_squares_dd_solver_exp(
         raise ValueError('Expected "symmetric" or "hermitian" for the symmetry parameter ')
     A.symmetry = symmetry
     
-    # Set "is_spd" flag to trigger Cholesky-based inversion of Schwarz blocks in the presmoother
-    A.is_spd = True
+    # Set "schwarz_use_cholesky" flag to trigger Cholesky-based inversion of Schwarz blocks in the presmoother. The matrix here A here must be SPD.
+    A.schwarz_use_cholesky = True
 
     if A.shape[0] != A.shape[1]:
         raise ValueError('expected square matrix')

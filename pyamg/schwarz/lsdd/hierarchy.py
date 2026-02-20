@@ -130,16 +130,12 @@ def _lsdd_coarsen_operators(*, A: SparseLike, B: SparseLike, P: SparseLike, R: S
     with stats.timeit("coarsen_R_AP"):
         A_c = R @ AP
 
-    # Preserve metadata 
-    fine_sym = getattr(A, "symmetry", None)
-    fine_is_spd = getattr(A, "is_spd", None)
-    if fine_sym is not None:
-        A_c.symmetry = fine_sym
-    if fine_is_spd is not None:
-        A_c.is_spd = fine_is_spd
-
     with stats.timeit("coarsen_sort"):
         A_c.sort_indices()
+
+    # Pass-on metadata of A. Note that the solver requires both a valid "symmetry" attribute, and the A on all level to carry the "schwarz_use_cholesky" attribute as True.
+    A_c.symmetry = getattr(A, "symmetry")
+    A_c.schwarz_use_cholesky = True
 
     # TODO(): There should be a simple function somewhere that returns true or false for whether this will be the last level or not, so that we're not duplicating the logic here.
     # Decide whether the *new* level will be extended further.
@@ -302,6 +298,8 @@ def _lsdd_extend_hierarchy(
 
     # ---- per-aggregate dense GEP ----
     eigvals_kept: list[float] = []
+    gep_timers: dict[str, float] = {}  # accumulates sub-timers across all aggregates on this level
+
     with stats.timeit("gep"):
         for i in range(level.n_aggs):
             counter = _lsdd_process_one_aggregate_gep(
@@ -314,7 +312,12 @@ def _lsdd_extend_hierarchy(
                 p_c=p_c,
                 p_v=p_v,
                 eigvals_kept=eigvals_kept,
+                gep_timers=gep_timers,   # NEW
             )
+
+    # Record sub-timers for printing (do not include these in the overall "total" sum in stats.py)
+    for k, dt in gep_timers.items():
+        stats.timings[k] = dt
 
     # ---- assemble P ----
     with stats.timeit("assemble_P"):
