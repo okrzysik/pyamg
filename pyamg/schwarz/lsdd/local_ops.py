@@ -97,29 +97,32 @@ def _lsdd_extract_local_principal_submatrices(*, level: LSDDLevel, A) -> None:
     blocks.auxiliary = np.zeros(blocks.submatrices_ptr[-1], dtype=blocks.submatrices.dtype)
 
 
-def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, BT, v_row_mult: np.ndarray, kappa: float, threshold: float | None) -> tuple[list, list, list, int]:
+def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, v_row_mult: np.ndarray, kappa: float, threshold: float | None) -> tuple[list, list, list, int]:
     """Fill local splitting blocks \\tilde{A}_i and initialize GEP/P assembly state.
+
+    This routine fills `level.blocks.auxiliary` with dense SPSD local splitting blocks
+    \\tilde{A}_i constructed from *rows of B* restricted to each overlap OMEGA_i.
 
     Parameters
     ----------
     level
         Current level. Requires:
-          - level.n_aggs
-          - level.sub.R_rows (list of per-aggregate B-row index arrays)
-          - level.sub.OMEGA  (list of per-aggregate DOF index arrays)
-          - level.sub.number_of_colors, level.sub.multiplicity (scalars)
-          - level.blocks.auxiliary and level.blocks.submatrices_ptr
-          - level.eigs (EigenInfo container)
+        - `level.n_aggs`
+        - `level.sub.R_rows` (list of per-aggregate B-row index arrays)
+        - `level.sub.OMEGA`  (list of per-aggregate DOF index arrays)
+        - `level.sub.number_of_colors`, `level.sub.multiplicity` (scalars)
+        - `level.blocks.auxiliary` and `level.blocks.submatrices_ptr`
+        - `level.eigs` (EigenInfo container)
 
-    B, BT
-        Least-squares factor B and its transpose BT (CSR-like).
+    B
+        Least-squares factor on this level (CSR-like), shape (m_rows, n_cols).
 
     v_row_mult
-        Row multiplicities array of shape (m,).
+        Row multiplicities array of shape (m_rows,). Passed through to the compiled kernel.
 
     kappa, threshold
-        If threshold is None, set a default threshold using kappa/colors/multiplicity.
-        Otherwise use the given threshold.
+        If `threshold` is None, a default threshold is computed from kappa/colors/multiplicity.
+        Otherwise the given threshold is used.
 
     Returns
     -------
@@ -129,8 +132,6 @@ def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, BT, v_row_mu
     sub = level.sub
     blocks = level.blocks
     eigs = level.eigs
-
-    BTT = BT.T.conjugate().tocsr()
 
     rows_indptr = np.zeros(level.n_aggs + 1, dtype=np.int32)
     cols_indptr = np.zeros(level.n_aggs + 1, dtype=np.int32)
@@ -147,9 +148,9 @@ def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, BT, v_row_mu
         B.indptr,
         B.indices,
         B.data,
-        BTT.indptr,
-        BTT.indices,
-        BTT.data,
+        B.indptr,
+        B.indices,
+        B.data,
         v_row_mult,
         rows_flat,
         rows_indptr,

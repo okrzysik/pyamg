@@ -84,45 +84,90 @@ def _lsdd_assemble_P_from_triplets(
     vals = np.concatenate(p_v)
 
     level.P = csr_array((vals, (rows, cols)), shape=(n_fine, counter))
-    level.R = level.P.T.conjugate().tocsr()
+    level.R = level.P.T.tocsr()
     return counter
 
 
-def _lsdd_coarsen_operators(*, B: SparseLike, BT: SparseLike, P: SparseLike, R: SparseLike) -> tuple[SparseLike, SparseLike, SparseLike]:
-    """Form coarse operators via least-squares propagation.
+def _lsdd_coarsen_operators(*, A: SparseLike, B: SparseLike, P: SparseLike, R: SparseLike, stats, levels, cfg) -> tuple[SparseLike, SparseLike, SparseLike]:
+    """Form coarse operators for the next level.
+
+    This routine always propagates the least-squares factor:
+        B_c = B @ P
+
+    The coarse SPD operator is formed via the Galerkin triple product:
+        A_c = R @ A @ P
 
     Parameters
     ----------
-    B, BT
-        Fine-level least-squares factors on this level, with A = BT @ B.
-        Shapes: B is (m x n), BT is (n x m).
-
+    A
+        Fine-level SPD operator on this level (square), shape (n_fine, n_fine).
+    B
+        Fine-level least-squares factor on this level, shape (m_rows, n_fine).
     P, R
-        Prolongation and restriction on this level. Shapes: P is (n x n_c),
-        R is (n_c x n). Typically R = P^H.
+        Prolongation and restriction, shapes (n_fine, n_coarse) and (n_coarse, n_fine).
+        Typically R = P^T for this real-only implementation.
 
     Returns
     -------
     A_c, B_c, BT_c
         Coarse operators:
           - B_c  = B @ P
-          - BT_c = B_c.T (CSR)  [chosen for performance; consistent for real-valued problems]
-          - A_c  = BT_c @ B_c
+          - A_c  = R @ A @ P
+          - BT_c = B_c.T (CSR/CSC depending on your storage convention)
 
     Notes
     -----
-    The implementation currently constructs BT_c by transposing B_c rather than
-    explicitly computing R @ BT. This matches the existing performance-oriented
-    approach used in the experimental branch.
+    Using A_c = R @ A @ P is typically much faster than forming A_c as (B @ P)^T (B @ P),
+    while being algebraically equivalent when A = B^T B and R = P^T. This often cuts coarsen time hard, because it avoids the “inflate B then Gram it” path.
     """
-    B_c = B @ P
-    BT_c = B_c.T.tocsr()
-    A_c = BT_c @ B_c
-    A_c.sort_indices()
-    return A_c, B_c, BT_c
+
+    with stats.timeit("coarsen_P_to_csc"):
+        P_csc = P if getattr(P, "format", None) == "csc" else P.tocsc()
+
+    with stats.timeit("coarsen_A_P"):
+        AP = A @ P_csc
+
+    with stats.timeit("coarsen_R_AP"):
+        A_c = R @ AP
+
+    # Preserve metadata 
+    fine_sym = getattr(A, "symmetry", None)
+    fine_is_spd = getattr(A, "is_spd", None)
+    if fine_sym is not None:
+        A_c.symmetry = fine_sym
+    if fine_is_spd is not None:
+        A_c.is_spd = fine_is_spd
+
+    with stats.timeit("coarsen_sort"):
+        A_c.sort_indices()
+
+    # TODO(): There should be a simple function somewhere that returns true or false for whether this will be the last level or not, so that we're not duplicating the logic here.
+    # Decide whether the *new* level will be extended further.
+    # This matches the wrapper while-condition evaluated on the next iteration.
+    density_c = A_c.nnz / (A_c.shape[0] ** 2)
+    need_B_c = (
+        (len(levels) + 1) < cfg.max_levels
+        and A_c.shape[0] > cfg.max_coarse
+        and density_c < cfg.max_density
+    )
+
+    B_c = None
+    if need_B_c:
+        with stats.timeit("coarsen_B_P"):
+            B_c = B @ P_csc
+
+        with stats.timeit("coarsen_sort"):
+            B_c.sort_indices()
+
+    return A_c, B_c
 
 
-def _lsdd_append_next_level(*, levels: list[MultilevelSolver.Level], A: SparseLike, B: SparseLike, BT: SparseLike) -> MultilevelSolver.Level:
+def _lsdd_append_next_level(
+    *,
+    levels: list[MultilevelSolver.Level],
+    A: SparseLike,
+    B: SparseLike | None,
+) -> MultilevelSolver.Level:
     """Append a new multigrid level and store A/B/BT and density metadata.
 
     Parameters
@@ -130,7 +175,7 @@ def _lsdd_append_next_level(*, levels: list[MultilevelSolver.Level], A: SparseLi
     levels
         List of MultilevelSolver levels. Mutated by appending one new Level().
 
-    A, B, BT
+    A, B
         Coarse-level operators to store on the newly appended level.
 
     Returns
@@ -142,8 +187,7 @@ def _lsdd_append_next_level(*, levels: list[MultilevelSolver.Level], A: SparseLi
     nxt = levels[-1]
     nxt.A = A
     nxt.B = B
-    nxt.BT = BT
-    nxt.density = len(nxt.A.data) / (nxt.A.shape[0] ** 2)
+    nxt.density = nxt.A.nnz / (nxt.A.shape[0] ** 2)
     return nxt
 
 
@@ -178,7 +222,7 @@ def _lsdd_extend_hierarchy(
 
     Notes
     -----
-    Required attributes on the current level include `A`, `B`, `BT`.
+    Required attributes on the current level include `A`, `B`
     This routine sets/updates `sub`, `blocks`, `eigs`, `P`, `R` on the current level and
     appends the next level with coarsened operators.
     """
@@ -203,7 +247,6 @@ def _lsdd_extend_hierarchy(
     level = cast(LSDDLevel, levels[-1])
     A = level.A
     B = level.B
-    BT = level.BT
 
     stats = LsddLevelStats(level=len(levels) - 1, n_fine=A.shape[0])
 
@@ -213,7 +256,6 @@ def _lsdd_extend_hierarchy(
             fdiag = _lsdd_filter_ops_inplace(
                 A=A,
                 B=B,
-                BT=BT,
                 filteringA=cfg.filteringA,
                 filteringB=cfg.filteringB,
             )
@@ -221,7 +263,6 @@ def _lsdd_extend_hierarchy(
         # Store under stable keys for stats printing
         for k, v in fdiag.items():
             stats.extra[f"filter_{k}"] = v
-
 
     # ---- strength-of-connection ----
     with stats.timeit("strength"):
@@ -241,13 +282,7 @@ def _lsdd_extend_hierarchy(
 
     # ---- overlap construction + PoU ----
     with stats.timeit("overlap"):
-        _lsdd_build_overlap_and_pou(
-            level=level,
-            A=A,
-            BT=BT,
-            v_row_mult=v_row_mult,
-            print_info=cfg.print_info,
-        )
+        _lsdd_build_overlap_and_pou(level=level, A=A, B=B, v_row_mult=v_row_mult, print_info=cfg.print_info)
 
 
     # ---- dense principal submatrices ----
@@ -260,7 +295,6 @@ def _lsdd_extend_hierarchy(
         p_r, p_c, p_v, counter = _lsdd_local_outer_products_and_gep_init(
             level=level,
             B=B,
-            BT=BT,
             v_row_mult=v_row_mult,
             kappa=cfg.kappa,
             threshold=cfg.threshold,
@@ -294,18 +328,11 @@ def _lsdd_extend_hierarchy(
         )
 
     # ---- coarsen operators ----
-    fine_sym = getattr(level.A, "symmetry", None)
-    fine_is_spd = getattr(level.A, "is_spd", None)
-
     with stats.timeit("coarsen"):
-        A_c, B_c, BT_c = _lsdd_coarsen_operators(B=B, BT=BT, P=level.P, R=level.R)
+        A_c, B_c = _lsdd_coarsen_operators(A = A, B=B, P=level.P, R=level.R, stats=stats, levels=levels, cfg=cfg)
 
-        if fine_sym is not None:
-            A_c.symmetry = fine_sym
-        if fine_is_spd is not None:
-            A_c.is_spd = fine_is_spd
 
     _lsdd_finalize_level_stats(stats=stats, level=level, eigvals_kept=eigvals_kept, n_coarse=A_c.shape[0])
     _lsdd_print_level_summary(stats, print_info=cfg.print_info)
 
-    _lsdd_append_next_level(levels=levels, A=A_c, B=B_c, BT=BT_c)
+    _lsdd_append_next_level(levels=levels, A=A_c, B=B_c)

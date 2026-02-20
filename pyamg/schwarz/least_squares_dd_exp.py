@@ -208,6 +208,9 @@ def least_squares_dd_solver_exp(
             filteringA=filteringA,
             filteringB=filteringB,
             print_info=print_info,
+            max_levels=max_levels,
+            max_coarse=max_coarse,
+            max_density=max_density,
         )
 
         _lsdd_extend_hierarchy(

@@ -31,6 +31,9 @@ from .types import LSDDLevel
 import numpy as np
 from scipy.linalg import eigh
 
+from scipy.linalg import cho_factor, cho_solve, LinAlgError
+
+
 
 def _lsdd_process_one_aggregate_gep(
     *,
@@ -128,10 +131,13 @@ def _lsdd_process_one_aggregate_gep(
     bb_full = b_flat.reshape((b_dim, b_dim))
 
     # ---- regularize bb to avoid breakdowns in the Schur complement ----
-    #normbb = float(np.linalg.norm(bb_full, ord=2))
-    normbb = float(np.linalg.norm(bb_full, ord="fro"))
-    eps = 1e-10 * normbb if normbb != 0.0 else 1e-10
-    bb_full = bb_full + eps * np.eye(bb_full.shape[0], dtype=bb_full.dtype)
+    # Use a cheap scale; avoid spectral norm (ord=2) which is SVD-cost.
+    bb_full = bb_full.copy()  # do not mutate the flattened storage
+    scale = float(np.linalg.norm(bb_full, ord="fro"))
+    eps = 1e-10 * scale if scale != 0.0 else 1e-10
+
+    # add eps*I without allocating an identity matrix
+    bb_full.flat[:: bb_full.shape[0] + 1] += eps
 
     # ---- cap number of eigenpairs to keep (per aggregate) ----
     omega_size_global = int(level.sub.n_omega[i])
@@ -156,7 +162,12 @@ def _lsdd_process_one_aggregate_gep(
         bb_GG = bb_full[np.ix_(GAMMA, GAMMA)]
         bb_Go = bb_full[np.ix_(GAMMA, omega)]
         # X = (bb_GG)^{-1} bb_Go
-        X = np.linalg.solve(bb_GG, bb_Go)
+        try:
+            c, lower = cho_factor(bb_GG, lower=True, check_finite=False)
+            X = cho_solve((c, lower), bb_Go, check_finite=False)
+        except LinAlgError:
+            X = np.linalg.solve(bb_GG, bb_Go)
+
         S = bb_full[np.ix_(omega, omega)] - bb_full[np.ix_(omega, GAMMA)] @ X
 
     # ---- solve GEP; optionally compute only the largest max_keep eigenpairs ----

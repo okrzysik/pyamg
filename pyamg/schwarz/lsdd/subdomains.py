@@ -18,7 +18,7 @@ from .types import LSDDLevel
 import numpy as np
 from scipy.sparse import csr_array
 
-def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, BT, v_row_mult: np.ndarray, print_info: bool) -> None:
+def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, B, v_row_mult: np.ndarray, print_info: bool) -> None:
     """Build omega/OMEGA/GAMMA, row sets, and PoU masks for all aggregates.
 
     Parameters
@@ -32,9 +32,9 @@ def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, BT, v_row_mult: np.ndarr
     A
         CSR-like operator on this level; used for graph adjacency to define OMEGA_i.
 
-    BT
-        CSR-like transpose factor (n x m). Used to define row sets R_rows_i via
-        adjacency in BT.
+    B
+        CSR-like factor (m x n) in CSR format. Used to define row sets R_rows_i via
+        adjacency in B.
 
     v_row_mult
         Array of shape (m,), updated in-place so that v_row_mult[r] counts how many
@@ -54,6 +54,16 @@ def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, BT, v_row_mult: np.ndarr
       - sub.nodes_vs_subdomains, sub.T, sub.number_of_colors, sub.multiplicity
       - sub.PoU_flat reset to None (cache invalidated)
     """
+
+    # Create a CSC copy of B for efficient column slicing to define R_rows_i
+    B_csc = B if getattr(B, "format", None) == "csc" else B.tocsc()
+    # Note that the slicing we do below does not require sorted indices
+    # if hasattr(B_csc, "sort_indices") and not B_csc.has_sorted_indices:
+    #     B_csc.sort_indices()
+
+    # B_csc = B.T.tocsr() # == BT that was originally used here...
+    # B_csc.sort_indices()  # ensure sorted for efficient slicing
+
     sub = level.sub
 
     nodes_r: list[np.ndarray] = []
@@ -80,7 +90,7 @@ def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, BT, v_row_mult: np.ndarr
         # R_rows_i: union of B-row indices touching omega_i (via BT adjacency)
         rows = []
         for j in omega_i:
-            rows.append(BT.indices[BT.indptr[j] : BT.indptr[j + 1]])
+            rows.append(B_csc.indices[B_csc.indptr[j] : B_csc.indptr[j + 1]])
         R_rows_i = np.unique(np.concatenate(rows, dtype=np.int32))
         sub.R_rows[i] = R_rows_i
         v_row_mult[R_rows_i] += 1

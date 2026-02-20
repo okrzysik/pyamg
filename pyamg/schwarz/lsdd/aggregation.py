@@ -214,7 +214,6 @@ def _lsdd_filter_ops_inplace(
     *,
     A,
     B,
-    BT,
     filteringA: FilteringSpec | None,
     filteringB: FilteringSpec | None,
 ) -> dict[str, int]:
@@ -238,19 +237,16 @@ def _lsdd_filter_ops_inplace(
     diag
         Dictionary of nnz counts before and after filtering, with keys 
             if filteringA: "A_nnz_before", "A_nnz_after"  
-            if filteringB: "B_nnz_before", "B_nnz_after", "BT_nnz_before", "BT_nnz_after".
+            if filteringB: "B_nnz_before", "B_nnz_after"
     """
     diag: dict[str, int] = {}
 
     if filteringB is not None and filteringB[1] != 0:
         diag["B_nnz_before"] = int(len(B.data))
-        diag["BT_nnz_before"] = int(len(BT.data))
 
         filter_matrix_rows(B, filteringB[1], diagonal=True, lump=filteringB[0])
-        filter_matrix_rows(BT, filteringB[1], diagonal=True, lump=filteringB[0])
 
         diag["B_nnz_after"] = int(len(B.data))
-        diag["BT_nnz_after"] = int(len(BT.data))
 
     if filteringA is not None and filteringA[1] != 0:
         diag["A_nnz_before"] = int(len(A.data))

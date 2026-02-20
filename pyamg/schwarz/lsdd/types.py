@@ -93,6 +93,12 @@ class LSDDConfig:
         (lump_diagonal, theta).
     print_info : bool
         Whether to record and print per-level diagnostics via `lsdd.stats`.
+    max_levels : int
+        Global maximum number of multigrid levels.
+    max_coarse : int
+        Stop coarsening when the next-level dimension is <= max_coarse.
+    max_density : float
+        Stop coarsening when the next-level operator density is >= max_density.
     """
 
     agg_levels: int
@@ -103,6 +109,10 @@ class LSDDConfig:
     filteringA: tuple[bool, float] | None
     filteringB: tuple[bool, float] | None
     print_info: bool
+
+    max_levels: int
+    max_coarse: int
+    max_density: float
 
 
 @dataclass(slots=True)
@@ -218,7 +228,6 @@ class LSDDLevel(Protocol):
     # Core operators on this level
     A: SparseLike
     B: SparseLike
-    BT: SparseLike
 
     # Aggregation metadata
     AggOp: SparseLike

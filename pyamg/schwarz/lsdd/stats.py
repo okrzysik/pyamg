@@ -235,12 +235,6 @@ def _lsdd_print_level_summary(
         print(f"{indent}     filter:")
         print(f"{indent}       B   nnz: {fb} -> {fa}  drop={_fmt(drop)}")
 
-    fbtb = stats.extra.get("filter_BT_nnz_before")
-    fbta = stats.extra.get("filter_BT_nnz_after")
-    if fbtb is not None and fbta is not None and fbtb > 0:
-        drop = 1.0 - (fbta / fbtb)
-        print(f"{indent}       BT  nnz: {fbtb} -> {fbta}  drop={_fmt(drop)}")
-
     fab = stats.extra.get("filter_A_nnz_before")
     faa = stats.extra.get("filter_A_nnz_after")
     if fab is not None and faa is not None and fab > 0:
@@ -265,6 +259,12 @@ def _lsdd_print_level_summary(
     total = 0.0
     print(f"{indent}     timing:")
     for k in order:
+        if k == "coarsen":
+            sub = sorted(kk for kk in stats.timings if kk.startswith("coarsen_"))
+            for kk in sub:
+                # printed but not included in `total`
+                print(f"{indent}         {kk[8:]:<11} {_fmt_ms(stats.timings[kk])}")
+
         if k in stats.timings:
             v = stats.timings[k]
             total += v
