@@ -52,21 +52,12 @@ Each level stores:
 - `level.blocks` : `LocalBlocks`
 - `level.eigs` : `EigenInfo`
 
-Backwards compatibility aliases were intentionally removed. The code should not reference:
-- `level.nonoverlapping_subdomain`, `level.overlapping_subdomain`, `level.overlapping_rows`,
-- `level.nIi`, `level.ni`,
-- `level.subdomain`, `level.subdomain_ptr`,
-- `level.threshold`, `level.nev`, `level.min_ev`,
-etc.
-
 ## Printing / diagnostics policy (already implemented)
 - No `print()` outside `lsdd/stats.py`.
 - Diagnostics from filtering, PoU check, eigen selection, RAS profiling, and timings are collected into `LsddLevelStats.extra` and printed by `stats.py`.
 
 ## Known ambiguity that needs fixing next
-- `level.N` currently means **number of aggregates on the level**. This clashes with common use of `N` as a matrix dimension.
 - Plan: rename everywhere:
-  - `level.N` → `level.n_aggs` (and update loops, allocations, shapes, stats labels)
   - use `n_fine = A.shape[0]` for fine dimension
   - use `m_rows = B.shape[0]`, `n_cols = B.shape[1]` when discussing B/A
 
@@ -77,7 +68,6 @@ Filtering is currently implemented via `pyamg.util.utils.filter_matrix_rows`, so
 
 ## Refactor goals for the next chat (no “algorithm redesign” yet)
 Main objectives:
-1. **Rename** `level.N → level.n_aggs` everywhere.
 2. Tighten typing internally:
    - Introduce a `Protocol` (e.g. `LSDDLevel`) to type `level` in internal functions instead of `Any`.
    - Use concrete return types where feasible.
@@ -206,6 +196,5 @@ The experimental solver is split into focused modules:
 - Use `pyamg/tests/schwarz/test_lsdd_compare.py` as a guardrail for performance regressions and correctness.
 
 ## Planned next cleanup
-- Rename `level.N` to `level.n_aggs` everywhere to eliminate ambiguity with matrix sizes.
 - Tighten typing via a `Protocol` for the level object to reduce reliance on `Any`.
 - Consider consolidating solver options into a config dataclass for reproducible experiments.

@@ -23,6 +23,8 @@ stats
 
 from __future__ import annotations
 
+from . import aggregation, eigs, hierarchy, local_ops, stats, smoothers, subdomains
+
 __all__ = [
     "aggregation",
     "subdomains",

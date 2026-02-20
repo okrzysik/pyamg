@@ -25,12 +25,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from .types import LSDDLevel
 import numpy as np
 
 SmootherSpec = tuple[str, dict[str, Any]]
 
 
-def lsdd_make_smoother_spec(*, level: Any, smoother: str | None) -> SmootherSpec | None:
+def lsdd_make_smoother_spec(*, level: LSDDLevel, smoother: str | None) -> SmootherSpec | None:
     """Return a PyAMG smoother specification for one multigrid level.
 
     Parameters

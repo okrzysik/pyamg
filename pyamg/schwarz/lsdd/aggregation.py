@@ -31,6 +31,7 @@ allocates per-aggregate storage on the level (Subdomains/LocalBlocks/EigenInfo).
 from __future__ import annotations
 
 from typing import Any
+from .types import FilteringSpec
 
 import numpy as np
 
@@ -214,8 +215,8 @@ def _lsdd_filter_ops_inplace(
     A,
     B,
     BT,
-    filteringA: tuple[bool, float] | None,
-    filteringB: tuple[bool, float] | None,
+    filteringA: FilteringSpec | None,
+    filteringB: FilteringSpec | None,
 ) -> dict[str, int]:
 
     """Optionally filter A/B/BT in-place.
@@ -410,7 +411,7 @@ def _lsdd_init_level_after_aggregation(*, level, AggOp, A, B) -> np.ndarray:
     level
         Multigrid level object (mutated in-place).
     AggOp
-        CSR aggregation operator of shape (n_fine, N).
+        CSR aggregation operator of shape (n_fine, n_aggs).
     A
         SPD operator on this level (only used for sizing).
     B
@@ -419,7 +420,7 @@ def _lsdd_init_level_after_aggregation(*, level, AggOp, A, B) -> np.ndarray:
     Side effects
     ------------
     Sets:
-      - level.AggOp, level.AggOpT, level.N
+      - level.AggOp, level.AggOpT, level.n_aggs
       - level.sub   : Subdomains container (omega/OMEGA/GAMMA/PoU/rows + size arrays)
       - level.blocks: LocalBlocks container (flattened dense block storage)
       - level.eigs  : EigenInfo container (nev per agg, threshold, min_ev)
@@ -432,11 +433,11 @@ def _lsdd_init_level_after_aggregation(*, level, AggOp, A, B) -> np.ndarray:
     """
     level.AggOp = AggOp
     level.AggOpT = AggOp.T.tocsr()
-    level.N = int(AggOp.shape[1])
+    level.n_aggs = int(AggOp.shape[1])
 
-    level.sub = Subdomains.allocate(level.N)
+    level.sub = Subdomains.allocate(level.n_aggs)
     level.blocks = LocalBlocks()
-    level.eigs = EigenInfo.allocate(level.N)
+    level.eigs = EigenInfo.allocate(level.n_aggs)
 
     # v_row_mult is filled during overlap construction and then reused in outer products
     v_row_mult = np.zeros(B.shape[0], dtype=float)

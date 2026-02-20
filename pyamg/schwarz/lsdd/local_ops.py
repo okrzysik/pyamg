@@ -30,20 +30,22 @@ Dense blocks are stored in flattened arrays:
 
 from __future__ import annotations
 
-from typing import Any
+from .types import LSDDLevel
 
 import numpy as np
 
 from pyamg import amg_core
 
-def _lsdd_extract_local_principal_submatrices(*, level: Any, A) -> None:
+from .types import PTripletRows, PTripletCols, PTripletVals
+
+def _lsdd_extract_local_principal_submatrices(*, level: LSDDLevel, A) -> None:
     """Extract dense principal blocks A[OMEGA_i, OMEGA_i] for all aggregates.
 
     Parameters
     ----------
     level
         Current multigrid level. Requires:
-          - level.N
+          - level.n_aggs
           - level.sub.OMEGA (list of global OMEGA_i arrays)
           - level.sub.n_OMEGA (int32 array of sizes)
           - level.blocks (LocalBlocks container)
@@ -65,17 +67,17 @@ def _lsdd_extract_local_principal_submatrices(*, level: Any, A) -> None:
     n_tot = int(np.sum(blocksize))
 
     blocks.subdomain = np.zeros(n_tot, dtype=np.int32)
-    blocks.subdomain_ptr = np.zeros(level.N + 1, dtype=np.int32)
+    blocks.subdomain_ptr = np.zeros(level.n_aggs + 1, dtype=np.int32)
     blocks.subdomain_ptr[0] = 0
 
-    for i in range(level.N):
+    for i in range(level.n_aggs):
         bs = int(blocksize[i])
         blocks.subdomain_ptr[i + 1] = blocks.subdomain_ptr[i] + bs
         blocks.subdomain[blocks.subdomain_ptr[i] : blocks.subdomain_ptr[i + 1]] = sub.OMEGA[i]
 
-    blocks.submatrices_ptr = np.zeros(level.N + 1, dtype=np.int32)
+    blocks.submatrices_ptr = np.zeros(level.n_aggs + 1, dtype=np.int32)
     blocks.submatrices_ptr[0] = 0
-    for i in range(level.N):
+    for i in range(level.n_aggs):
         bs = int(blocksize[i])
         blocks.submatrices_ptr[i + 1] = blocks.submatrices_ptr[i] + bs * bs
 
@@ -95,22 +97,14 @@ def _lsdd_extract_local_principal_submatrices(*, level: Any, A) -> None:
     blocks.auxiliary = np.zeros(blocks.submatrices_ptr[-1], dtype=blocks.submatrices.dtype)
 
 
-def _lsdd_local_outer_products_and_gep_init(
-    *,
-    level: Any,
-    B,
-    BT,
-    v_row_mult: np.ndarray,
-    kappa: float,
-    threshold: float | None,
-) -> tuple[list, list, list, int]:
+def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, BT, v_row_mult: np.ndarray, kappa: float, threshold: float | None) -> tuple[list, list, list, int]:
     """Fill local splitting blocks \\tilde{A}_i and initialize GEP/P assembly state.
 
     Parameters
     ----------
     level
         Current level. Requires:
-          - level.N
+          - level.n_aggs
           - level.sub.R_rows (list of per-aggregate B-row index arrays)
           - level.sub.OMEGA  (list of per-aggregate DOF index arrays)
           - level.sub.number_of_colors, level.sub.multiplicity (scalars)
@@ -138,9 +132,9 @@ def _lsdd_local_outer_products_and_gep_init(
 
     BTT = BT.T.conjugate().tocsr()
 
-    rows_indptr = np.zeros(level.N + 1, dtype=np.int32)
-    cols_indptr = np.zeros(level.N + 1, dtype=np.int32)
-    for i in range(level.N):
+    rows_indptr = np.zeros(level.n_aggs + 1, dtype=np.int32)
+    cols_indptr = np.zeros(level.n_aggs + 1, dtype=np.int32)
+    for i in range(level.n_aggs):
         rows_indptr[i + 1] = rows_indptr[i] + len(sub.R_rows[i])
         cols_indptr[i + 1] = cols_indptr[i] + len(sub.OMEGA[i])
 
@@ -173,8 +167,9 @@ def _lsdd_local_outer_products_and_gep_init(
     eigs.threshold = thr
     eigs.min_ev = 1e12
 
-    p_r: list = []
-    p_c: list = []
-    p_v: list = []
+    p_r: PTripletRows = []
+    p_c: PTripletCols = []
+    p_v: PTripletVals = []
     counter = 0
     return p_r, p_c, p_v, counter
+    

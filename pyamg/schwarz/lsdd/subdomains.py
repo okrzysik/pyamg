@@ -13,27 +13,19 @@ for diagnostics and default threshold choices.
 
 from __future__ import annotations
 
-from warnings import warn
-from typing import Any
+from .types import LSDDLevel
 
 import numpy as np
 from scipy.sparse import csr_array
 
-def _lsdd_build_overlap_and_pou(
-    *,
-    level: Any,
-    A,
-    BT,
-    v_row_mult: np.ndarray,
-    print_info: bool,
-) -> None:
+def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, BT, v_row_mult: np.ndarray, print_info: bool) -> None:
     """Build omega/OMEGA/GAMMA, row sets, and PoU masks for all aggregates.
 
     Parameters
     ----------
     level
         Current multigrid level. Required:
-          - level.N
+          - level.n_aggs
           - level.AggOpT (CSR)
           - level.sub (Subdomains container already allocated)
 
@@ -68,7 +60,7 @@ def _lsdd_build_overlap_and_pou(
     nodes_c: list[np.ndarray] = []
     nodes_v: list[np.ndarray] = []
 
-    for i in range(level.N):
+    for i in range(level.n_aggs):
         # omega_i: DOFs in aggregate i (global)
         omega_i = np.asarray(
             level.AggOpT.indices[level.AggOpT.indptr[i] : level.AggOpT.indptr[i + 1]],
@@ -102,7 +94,7 @@ def _lsdd_build_overlap_and_pou(
     cc = np.concatenate(nodes_c, dtype=np.int32)
     vv = np.concatenate(nodes_v, dtype=float)
 
-    sub.nodes_vs_subdomains = csr_array((vv, (rr, cc)), shape=(A.shape[0], level.N))
+    sub.nodes_vs_subdomains = csr_array((vv, (rr, cc)), shape=(A.shape[0], level.n_aggs))
 
     sub.T = sub.nodes_vs_subdomains.T @ sub.nodes_vs_subdomains
     sub.T.data[:] = 1
@@ -112,7 +104,7 @@ def _lsdd_build_overlap_and_pou(
     sub.multiplicity = float(np.max(v_row_mult))
 
     # PoU masks and GAMMA_i (vectorized per i)
-    for i in range(level.N):
+    for i in range(level.n_aggs):
         OMEGA_i = sub.OMEGA[i]
         omega_i = sub.omega[i]
         pou = np.isin(OMEGA_i, omega_i).astype(float)
@@ -127,7 +119,7 @@ def _lsdd_build_overlap_and_pou(
     if print_info:
         x = np.random.default_rng(0).random(A.shape[0])
         y = np.zeros_like(x)
-        for i in range(level.N):
+        for i in range(level.n_aggs):
             OMEGA_i = sub.OMEGA[i]
             y[OMEGA_i] += sub.PoU[i] * x[OMEGA_i]
 

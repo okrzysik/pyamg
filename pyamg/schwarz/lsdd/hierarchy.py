@@ -11,7 +11,11 @@ The public entrypoint used by `least_squares_dd_exp.py` is `_lsdd_extend_hierarc
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import cast
+from .types import LSDDLevel
+from .types import LSDDConfig
+
+
 
 import numpy as np
 
@@ -20,21 +24,14 @@ try:
 except Exception:  # pragma: no cover
     from scipy.sparse import csr_matrix as csr_array  # type: ignore
 
-from scipy.sparse import spmatrix
 
-try:
-    from scipy.sparse import sparray  # type: ignore
-except Exception:  # pragma: no cover
-    sparray = spmatrix  # type: ignore
-
+from .types import SparseLike
 from pyamg.multilevel import MultilevelSolver
-
-SparseLike = spmatrix | sparray
 
 
 def _lsdd_assemble_P_from_triplets(
     *,
-    level: Any,
+    level: LSDDLevel,
     n_fine: int,
     p_r: list,
     p_c: list,
@@ -47,8 +44,8 @@ def _lsdd_assemble_P_from_triplets(
     ----------
     level
         Current multigrid level object. This routine sets:
-          - `level.P` as a CSR sparse array/matrix of shape (n_fine, n_coarse)
-          - `level.R` as the conjugate-transpose of P in CSR form
+        - `level.P` as a CSR sparse array/matrix of shape (n_fine, n_coarse)
+        - `level.R` as the conjugate-transpose of P in CSR form
 
     n_fine
         Fine dimension on this level, i.e. `A.shape[0]`.
@@ -56,9 +53,9 @@ def _lsdd_assemble_P_from_triplets(
     p_r, p_c, p_v
         Triplet lists accumulated during the per-aggregate eigenproblem loop:
 
-          - `p_r[k]` is an int32 array of global row indices for the k-th inserted vector
-          - `p_c[k]` is a list/array of the same length containing the coarse column id
-          - `p_v[k]` is a float/complex array of the same length containing values
+        - `p_r[k]` is an int32 array of global row indices for the k-th inserted vector
+        - `p_c[k]` is an int32 array of the same length filled with the coarse column id
+        - `p_v[k]` is a float/complex array of the same length containing values
 
         Each k corresponds to one prolongation column supported on omega_i.
 
@@ -77,9 +74,9 @@ def _lsdd_assemble_P_from_triplets(
     a 1-dimensional coarse space supported on row 0, to ensure the hierarchy remains valid.
     """
     if len(p_r) == 0:
-        p_r = [[0]]
-        p_c = [[0]]
-        p_v = [[1]]
+        p_r = [np.array([0], dtype=np.int32)]
+        p_c = [np.array([0], dtype=np.int32)]
+        p_v = [np.array([1.0])]
         counter = 1
 
     rows = np.concatenate(p_r).astype(np.int32, copy=False)
@@ -125,7 +122,7 @@ def _lsdd_coarsen_operators(*, B: SparseLike, BT: SparseLike, P: SparseLike, R: 
     return A_c, B_c, BT_c
 
 
-def _lsdd_append_next_level(*, levels: list[Any], A: SparseLike, B: SparseLike, BT: SparseLike) -> MultilevelSolver.Level:
+def _lsdd_append_next_level(*, levels: list[MultilevelSolver.Level], A: SparseLike, B: SparseLike, BT: SparseLike) -> MultilevelSolver.Level:
     """Append a new multigrid level and store A/B/BT and density metadata.
 
     Parameters
@@ -152,58 +149,38 @@ def _lsdd_append_next_level(*, levels: list[Any], A: SparseLike, B: SparseLike, 
 
 def _lsdd_extend_hierarchy(
     *,
-    levels: list[Any],
-    strength: Sequence[Any],
-    aggregate: Sequence[Any],
-    agg_levels: int,
-    kappa: float,
-    nev: int | None,
-    threshold: float | None,
-    min_coarsening: int | None,
-    filteringA: Any,
-    filteringB: Any,
-    print_info: bool,
+    levels: list[MultilevelSolver.Level],
+    strength_spec: object,
+    aggregate_spec: object,
+    cfg: LSDDConfig,
 ) -> None:
-    """Extend the multigrid hierarchy by one level.
+    """Extend an LS–AMG–DD hierarchy by one level.
+
+    This function operates on the current finest level (the last element of `levels`),
+    constructs the prolongation `P`, forms the next-level operators, and appends the
+    new level to `levels`.
 
     Parameters
     ----------
-    levels
-        List of `MultilevelSolver.Level` objects. The routine reads the finest
-        level as `levels[-1]` and appends a new coarse level at the end.
+    levels : list[pyamg.multilevel.MultilevelSolver.Level]
+        Existing hierarchy levels. The last entry is treated as the current level and is
+        populated with per-level containers and operators; a new level is appended.
+    strength_spec : object
+        Strength-of-connection specification for the current level. This is the already
+        level-selected entry (e.g., `strength[lvl]`) and is interpreted by the strength
+        construction routine.
+    aggregate_spec : object
+        Aggregation specification for the current level. This is the already level-selected
+        entry (e.g., `aggregate[lvl]`) and is interpreted by the aggregation routine.
+    cfg : LSDDConfig
+        Configuration bundle for the extension step (aggregation passes, filtering specs,
+        eigen selection controls, and diagnostics flag).
 
-        Required fields on `levels[-1]`:
-          - `A`, `B`, `BT`
-          - (after aggregation init) various per-level storage fields
-
-    strength, aggregate
-        Levelized specs (index by current level) controlling strength-of-connection
-        and aggregation behavior.
-
-    agg_levels
-        Number of aggregation passes per level.
-
-    kappa
-        Parameter used in local splitting and threshold defaults.
-
-    nev, threshold
-        Eigenvector selection options passed to the per-aggregate GEP routine:
-          - if `nev` is not None: keep fixed count per aggregate
-          - otherwise: keep eigenpairs above `threshold` (or computed default)
-
-    min_coarsening
-        Per-aggregate cap on number of kept eigenpairs: floor(|omega_i| / min_coarsening).
-
-    filteringA, filteringB
-        Optional operator filtering controls passed into the filtering routine.
-
-    print_info
-        If True, print per-level timing and diagnostic summaries.
-
-    Side effects
-    ------------
-    - Mutates `levels[-1]` by setting aggregation/subdomain/block/eigs/P/R fields.
-    - Appends a new coarse level to `levels` via `_lsdd_append_next_level`.
+    Notes
+    -----
+    Required attributes on the current level include `A`, `B`, `BT`.
+    This routine sets/updates `sub`, `blocks`, `eigs`, `P`, `R` on the current level and
+    appends the next level with coarsened operators.
     """
     from .aggregation import (
         _lsdd_build_aggop,
@@ -223,7 +200,7 @@ def _lsdd_extend_hierarchy(
     )
     from .subdomains import _lsdd_build_overlap_and_pou
 
-    level = levels[-1]
+    level = cast(LSDDLevel, levels[-1])
     A = level.A
     B = level.B
     BT = level.BT
@@ -237,8 +214,8 @@ def _lsdd_extend_hierarchy(
                 A=A,
                 B=B,
                 BT=BT,
-                filteringA=filteringA,
-                filteringB=filteringB,
+                filteringA=cfg.filteringA,
+                filteringB=cfg.filteringB,
             )
 
         # Store under stable keys for stats printing
@@ -248,15 +225,15 @@ def _lsdd_extend_hierarchy(
 
     # ---- strength-of-connection ----
     with stats.timeit("strength"):
-        C = _lsdd_build_strength(A=A, B=B, strength_spec=strength[len(levels) - 1])
+        C = _lsdd_build_strength(A=A, B=B, strength_spec=strength_spec)
 
     # ---- aggregation ----
     with stats.timeit("aggregate"):
         AggOp, _nc_temp = _lsdd_build_aggop(
             A=A,
             C=C,
-            aggregate_spec=aggregate[len(levels) - 1],
-            agg_levels=agg_levels,
+            aggregate_spec=aggregate_spec,
+            agg_levels=cfg.agg_levels,
             is_finest=(len(levels) == 1),
         )
         v_row_mult = _lsdd_init_level_after_aggregation(level=level, AggOp=AggOp, A=A, B=B)
@@ -269,7 +246,7 @@ def _lsdd_extend_hierarchy(
             A=A,
             BT=BT,
             v_row_mult=v_row_mult,
-            print_info=print_info,
+            print_info=cfg.print_info,
         )
 
 
@@ -285,19 +262,19 @@ def _lsdd_extend_hierarchy(
             B=B,
             BT=BT,
             v_row_mult=v_row_mult,
-            kappa=kappa,
-            threshold=threshold,
+            kappa=cfg.kappa,
+            threshold=cfg.threshold,
         )
 
     # ---- per-aggregate dense GEP ----
     eigvals_kept: list[float] = []
     with stats.timeit("gep"):
-        for i in range(level.N):
+        for i in range(level.n_aggs):
             counter = _lsdd_process_one_aggregate_gep(
                 i=i,
                 level=level,
-                nev=nev,
-                min_coarsening=min_coarsening,
+                nev=cfg.nev,
+                min_coarsening=cfg.min_coarsening,
                 counter=counter,
                 p_r=p_r,
                 p_c=p_c,
@@ -329,6 +306,6 @@ def _lsdd_extend_hierarchy(
             A_c.is_spd = fine_is_spd
 
     _lsdd_finalize_level_stats(stats=stats, level=level, eigvals_kept=eigvals_kept, n_coarse=A_c.shape[0])
-    _lsdd_print_level_summary(stats, print_info=print_info)
+    _lsdd_print_level_summary(stats, print_info=cfg.print_info)
 
     _lsdd_append_next_level(levels=levels, A=A_c, B=B_c, BT=BT_c)

@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from typing import Any
 import time
 
+from .types import LSDDLevel
+
 import numpy as np
 
 
@@ -77,7 +79,7 @@ def _store_mmx(extra: dict[str, Any], base: str, arr) -> None:
     extra[f"{base}_max"] = float(np.max(a))
 
 
-def _lsdd_finalize_level_stats(*, stats, level, eigvals_kept, n_coarse: int) -> None:
+def _lsdd_finalize_level_stats(*, stats, level: LSDDLevel, eigvals_kept, n_coarse: int) -> None:
     """Populate derived stats/diagnostics for a completed hierarchy extension.
 
     Parameters
@@ -97,7 +99,7 @@ def _lsdd_finalize_level_stats(*, stats, level, eigvals_kept, n_coarse: int) -> 
     - Updates `stats.n_aggs`, `stats.n_coarse`, and fields in `stats.extra`.
     - Stores `stats` on the level as `level.lsdd_stats` for later inspection.
     """
-    stats.n_aggs = getattr(level, "N", None)
+    stats.n_aggs = getattr(level, "n_aggs", None)
     stats.n_coarse = int(n_coarse)
     stats.extra["cr"] = float(stats.n_fine / n_coarse) if n_coarse > 0 else float("inf")
 

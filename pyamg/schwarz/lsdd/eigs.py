@@ -26,7 +26,7 @@ Key conventions
 
 from __future__ import annotations
 
-from typing import Any
+from .types import LSDDLevel
 
 import numpy as np
 from scipy.linalg import eigh
@@ -35,7 +35,7 @@ from scipy.linalg import eigh
 def _lsdd_process_one_aggregate_gep(
     *,
     i: int,
-    level: Any,
+    level: LSDDLevel,
     nev: int | None,
     min_coarsening: int | None,
     counter: int,
@@ -55,19 +55,18 @@ def _lsdd_process_one_aggregate_gep(
         Current multigrid level object. Required attributes:
 
         Subdomain / PoU:
-          - `level.sub.PoU[i]`: ndarray of shape (|OMEGA_i|,), entries in {0,1}.
+        - `level.sub.PoU[i]`: ndarray of shape (|OMEGA_i|,), entries in {0,1}.
 
         Flattened dense blocks and index pointers (via `level.blocks`):
-          - `level.blocks.submatrices_ptr`: int32 array of shape (N+1,)
-          - `level.blocks.submatrices`: 1D array containing concatenated A_i blocks
-          - `level.blocks.auxiliary`: 1D array containing concatenated \\tilde{A}_i blocks
-          - `level.blocks.subdomain_ptr`: int32 array of shape (N+1,)
-          - `level.blocks.subdomain`: int32 array containing concatenated OMEGA_i indices
+        - `level.blocks.submatrices_ptr`: int32 array of shape (n_aggs+1,)
+        - `level.blocks.submatrices`: 1D array containing concatenated A_i blocks
+        - `level.blocks.auxiliary`: 1D array containing concatenated \\tilde{A}_i blocks
+        - `level.blocks.subdomain_ptr`: int32 array of shape (n_aggs+1,)
+        - `level.blocks.subdomain`: int32 array containing concatenated OMEGA_i indices
 
         Eigen-selection metadata:
-          - `level.eigs.threshold` (float) and `level.eigs.min_ev` (float)
-          - `level.eigs.nev` (int32 array length N)
-          Optionally the same data may also be available under `level.eigs.*`.
+        - `level.eigs.threshold` (float) and `level.eigs.min_ev` (float)
+        - `level.eigs.nev` (int32 array length n_aggs)
 
     nev
         If not None: keep exactly the largest `nev` eigenpairs, additionally capped by
@@ -86,12 +85,12 @@ def _lsdd_process_one_aggregate_gep(
         coarse column, and `counter` is incremented.
 
     p_r, p_c, p_v
-        Lists that store triplets used later to assemble P:
-          - p_r: list of int32 arrays of global row indices
-          - p_c: list of int arrays (same length) with the coarse column id
-          - p_v: list of float/complex arrays of values (same length as p_r entry)
+        Lists that store triplets used later to assemble P. These are mutated in-place.
 
-        These lists are mutated in-place.
+        - `p_r[k]`: int32 array of global row indices for the k-th prolongation column
+        - `p_c[k]`: int32 array of the same length, filled with the coarse column id
+        - `p_v[k]`: value array of the same length (float/complex), containing entries
+            for the k-th prolongation column on rows `p_r[k]`
 
     eigvals_kept
         If provided, eigenvalues that were accepted (kept) on this aggregate are
@@ -104,24 +103,6 @@ def _lsdd_process_one_aggregate_gep(
 
     Notes
     -----
-    Local matrices:
-      Let A_i = A[OMEGA_i, OMEGA_i] and Bsplit_i denote the local SPSD splitting block
-      (same shape). Restrict A_i to omega_i:
-
-          A_oo := A_i[omega, omega].
-
-      Compute the Schur complement of Bsplit_i onto omega_i:
-
-          S := Bsplit_oo - Bsplit_oG (Bsplit_GG)^{-1} Bsplit_Go.
-
-      Solve the generalized EVP on omega_i:
-
-          A_oo v = λ S v.
-
-    Selection:
-      - When `nev` is given: keep the largest `nev` eigenvalues/vectors.
-      - Otherwise: keep eigenpairs with λ > threshold.
-
     The SciPy routine `scipy.linalg.eigh` returns eigenvalues in nondecreasing order.
     """
     pou = level.sub.PoU[i]
@@ -147,7 +128,8 @@ def _lsdd_process_one_aggregate_gep(
     bb_full = b_flat.reshape((b_dim, b_dim))
 
     # ---- regularize bb to avoid breakdowns in the Schur complement ----
-    normbb = float(np.linalg.norm(bb_full, ord=2))
+    #normbb = float(np.linalg.norm(bb_full, ord=2))
+    normbb = float(np.linalg.norm(bb_full, ord="fro"))
     eps = 1e-10 * normbb if normbb != 0.0 else 1e-10
     bb_full = bb_full + eps * np.eye(bb_full.shape[0], dtype=bb_full.dtype)
 
@@ -217,7 +199,7 @@ def _lsdd_process_one_aggregate_gep(
 
         for j in range(keep):
             p_r.append(global_rows)
-            p_c.append([counter] * len(global_rows))
+            p_c.append(np.full(global_rows.shape[0], counter, dtype=np.int32))
             p_v.append(V_keep[:, j])
             counter += 1
 
@@ -240,7 +222,7 @@ def _lsdd_process_one_aggregate_gep(
         level.eigs.min_ev = min(level.eigs.min_ev, ev)
 
         p_r.append(global_rows)
-        p_c.append([counter] * len(global_rows))
+        p_c.append(np.full(global_rows.shape[0], counter, dtype=np.int32))
         p_v.append(V[:, j])
         counter += 1
 

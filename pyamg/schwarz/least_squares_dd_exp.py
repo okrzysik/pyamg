@@ -12,8 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from scipy.sparse import spmatrix, sparray
 
+from .lsdd.types import LSDDConfig
 
 from warnings import warn
 from scipy.sparse import csr_array, issparse, \
@@ -27,21 +27,11 @@ from pyamg.util.utils import asfptype, \
 
 from .lsdd.hierarchy import _lsdd_extend_hierarchy
 from .lsdd.smoothers import lsdd_make_smoother_spec
-
-
-
-
-
-# -----------------------------
-# Typing helpers (refactor-only)
-# -----------------------------
-SparseLike = spmatrix | sparray
+from .lsdd.types import FilteringSpec, SparseLike
 
 Symmetry = Literal["symmetric", "hermitian"]
 SmootherName = Literal["msm", "asm", "ras", "rasT"] | None
 
-# (lump_diagonal: bool, filter_strength: int/float)
-FilteringSpec = tuple[bool, int] | tuple[bool, float]
 
 
 def least_squares_dd_solver_exp(
@@ -61,8 +51,8 @@ def least_squares_dd_solver_exp(
     min_coarsening: int | list[int] | None = None,
     max_levels: int = 10,
     max_coarse: int = 100,
-    filteringA: FilteringSpec | None = (False, 0),
-    filteringB: FilteringSpec | None = (False, 0),
+    filteringA: FilteringSpec | None = (False, 0.0),
+    filteringB: FilteringSpec | None = (False, 0.0),
     max_density: float = 0.1,
     print_info: bool = False,
     **kwargs: Any,
@@ -185,6 +175,12 @@ def least_squares_dd_solver_exp(
     kappa =  levelize_weight(kappa,max_levels)
     min_coarsening = levelize_weight(min_coarsening,max_levels)
 
+    # Ensure filtering specs are in the form (bool, float)
+    if filteringA is not None:
+        filteringA = (bool(filteringA[0]), float(filteringA[1]))
+    if filteringB is not None:
+        filteringB = (bool(filteringB[0]), float(filteringB[1]))
+
     # Construct multilevel structure
     levels = []
     levels.append(MultilevelSolver.Level())
@@ -203,18 +199,22 @@ def least_squares_dd_solver_exp(
         levels[-1].density < max_density:
         
         # Extend the hierarchy
-        _lsdd_extend_hierarchy(
-            levels=levels,
-            strength=strength,
-            aggregate=aggregate,
+        cfg = LSDDConfig(
             agg_levels=agg_levels,
-            kappa=kappa[lvl],
+            kappa=float(kappa[lvl]),
             nev=nev,
             threshold=threshold,
             min_coarsening=min_coarsening[lvl],
             filteringA=filteringA,
             filteringB=filteringB,
             print_info=print_info,
+        )
+
+        _lsdd_extend_hierarchy(
+            levels=levels,
+            strength_spec=strength[lvl],
+            aggregate_spec=aggregate[lvl],
+            cfg=cfg,
         )
 
         # Determine the specifications for the smoother for this level 
