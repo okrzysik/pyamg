@@ -36,6 +36,8 @@ import numpy as np
 
 from pyamg import amg_core
 
+from time import perf_counter
+
 from .types import PTripletRows, PTripletCols, PTripletVals
 
 def _lsdd_extract_local_principal_submatrices(*, level: LSDDLevel, A) -> None:
@@ -97,7 +99,7 @@ def _lsdd_extract_local_principal_submatrices(*, level: LSDDLevel, A) -> None:
     blocks.auxiliary = np.zeros(blocks.submatrices_ptr[-1], dtype=blocks.submatrices.dtype)
 
 
-def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, v_row_mult: np.ndarray, kappa: float, threshold: float | None) -> tuple[list, list, list, int]:
+def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, v_row_mult: np.ndarray, kappa: float, threshold: float | None, timers, stats) -> tuple[list, list, list, int]:
     """Fill local splitting blocks \\tilde{A}_i and initialize GEP/P assembly state.
 
     This routine fills `level.blocks.auxiliary` with dense SPSD local splitting blocks
@@ -129,6 +131,8 @@ def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, v_row_mult: 
     p_r, p_c, p_v, counter
         Empty triplet lists and initial counter=0 for P assembly.
     """
+    t0 = perf_counter()
+
     sub = level.sub
     blocks = level.blocks
     eigs = level.eigs
@@ -142,6 +146,20 @@ def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, v_row_mult: 
     rows_flat = np.concatenate(sub.R_rows).astype(np.int32, copy=False)
     cols_flat = np.concatenate(sub.OMEGA).astype(np.int32, copy=False)
 
+    nnz_r = B.indptr[rows_flat+1] - B.indptr[rows_flat]
+    outerprod_stats = {
+        "nnz_r_total": int(np.sum(nnz_r)),
+        "nnz_r_mean": float(np.mean(nnz_r)),
+        "nnz_r_med": float(np.median(nnz_r)),
+        "nnz_r_max": int(np.max(nnz_r)),
+        "nnz_r_min": int(np.min(nnz_r)),
+        "nnz_r_sqsum": float(np.sum(nnz_r**2)),
+    }
+    stats.extra["outerprod"] = outerprod_stats
+
+    timers["outerprod_prep"] = perf_counter() - t0
+
+    t0 = perf_counter()
     amg_core.local_outer_product(
         B.shape[0],
         B.shape[1],
@@ -159,6 +177,7 @@ def _lsdd_local_outer_products_and_gep_init(*, level: LSDDLevel, B, v_row_mult: 
         blocks.auxiliary,
         blocks.submatrices_ptr,
     )
+    timers["outerprod_amgcore"] = perf_counter() - t0
 
     if threshold is None:
         thr = max(0.1, ((kappa / sub.number_of_colors) - 1) / sub.multiplicity)

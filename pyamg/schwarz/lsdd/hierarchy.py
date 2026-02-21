@@ -311,13 +311,20 @@ def _lsdd_extend_hierarchy(
 
     # ---- local splitting blocks + threshold init ----
     with stats.timeit("outerprod"):
+        outerprod_timers = {}
         p_r, p_c, p_v, counter = _lsdd_local_outer_products_and_gep_init(
             level=level,
             B=B,
             v_row_mult=v_row_mult,
             kappa=cfg.kappa,
             threshold=cfg.threshold,
+            timers=outerprod_timers,
+            stats=stats
         )
+
+    # Record sub-timers for printing (do not include these in the overall "total" sum in stats.py)
+    for k, dt in outerprod_timers.items():
+        stats.timings[k] = dt
 
     # ---- per-aggregate dense GEP ----
     eigvals_kept: list[float] = []

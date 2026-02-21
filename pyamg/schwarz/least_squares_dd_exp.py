@@ -110,6 +110,9 @@ def least_squares_dd_solver_exp(
         Configured multilevel solver.
     """
 
+    # filteringB = (False, 0.9)
+    # filteringA = (True, 1e-4)
+
     if A is not None:
         A_provided = True
         if not issparse(A) or A.format not in ('csr'):

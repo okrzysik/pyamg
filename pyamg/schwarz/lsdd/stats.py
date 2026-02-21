@@ -196,6 +196,11 @@ def _lsdd_print_level_summary(
     print(f"{indent}       GAMMA : {_mmx(stats.extra, 'GAMMA')}")
     print(f"{indent}       OMEGA : {_mmx(stats.extra, 'OMEGA')}")
 
+
+    print(f"{indent}     outerprod:")
+    print(f"{indent}       nnz_r (min/med/max) : {_mmx(stats.extra['outerprod'], 'nnz_r')}")
+    print(f"{indent}       sum(nnz_r**2)          : {_fmt(stats.extra['outerprod']['nnz_r_sqsum'])}")
+
     if "pou_rel_error" in stats.extra:
         print(f"{indent}       PoU err: {_fmt(stats.extra['pou_rel_error'])}")
 
@@ -263,6 +268,13 @@ def _lsdd_print_level_summary(
             v = stats.timings[k]
             total += v
             print(f"{indent}       {k:<11} {_fmt_ms(v)}")
+
+        # Print individual pieces for outerprod
+        if k == "outerprod":
+            sub = sorted(kk for kk in stats.timings if kk.startswith("outerprod_"))
+            for kk in sub:
+                # printed but not included in `total`
+                print(f"{indent}         {kk[10:]:<11} {_fmt_ms(stats.timings[kk])}")
 
         # Print individual pieces for gep
         if k == "gep":
