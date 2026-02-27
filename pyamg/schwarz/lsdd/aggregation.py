@@ -437,5 +437,10 @@ def _lsdd_init_level_after_aggregation(*, level, AggOp, A, B) -> np.ndarray:
 
     # v_row_mult is filled during overlap construction and then reused in outer products
     v_row_mult = np.zeros(B.shape[0], dtype=float)
+
+    # Store on the level so exploratory/theory checks can reproduce exactly what the
+    # production pipeline used without recomputing overlap/multiplicity.
+    level.v_row_mult = v_row_mult
+
     return v_row_mult
 

@@ -348,6 +348,41 @@ def _lsdd_extend_hierarchy(
     for k, dt in gep_timers.items():
         stats.timings[k] = dt
 
+    # ---- optional exploratory theory hooks (development / diagnostics) ----
+    if cfg.explore_theory:
+        from .eigs import _lsdd_theory_outerprod_weighting_sweep
+
+        # if cfg.explore_theory_aggs is None:
+        #     # Small deterministic sample: first, middle, last.
+        #     mid = level.n_aggs // 2
+        #     agg_ids = tuple(sorted(set([0, mid, max(0, level.n_aggs - 1)])))
+        # else:
+        #     agg_ids = cfg.explore_theory_aggs
+
+        # # Store results on the level for post-hoc interactive inspection.
+        # level.theory_outerprod_weighting = _lsdd_theory_outerprod_weighting_sweep(
+        #     level=level,
+        #     agg_ids=agg_ids,
+        # )
+
+        # print(f"Completed theory hooks for aggregates {agg_ids} on level {len(levels) - 1}.")
+        # print(f"level.theory_outerprod_weighting = {level.theory_outerprod_weighting}")
+
+
+        from pyamg.schwarz.lsdd.eigs import _lsdd_theory_explore_gep_spectra
+        # e.g. explore a few aggregates on level 0
+        res = _lsdd_theory_explore_gep_spectra(
+            level=level,
+            #agg_ids=[0, 1, 2],
+            #agg_ids = np.arange(0, level.n_aggs),
+            agg_ids = [0, level.n_aggs // 2, max(0, level.n_aggs - 1)],
+            plot=True,          # blocking per-aggregate
+        )
+
+        # import pdb
+        # pdb.set_trace()
+
+
     # ---- assemble P ----
     with stats.timeit("assemble_P"):
         _ = _lsdd_assemble_P_from_triplets(

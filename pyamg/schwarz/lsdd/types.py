@@ -99,6 +99,12 @@ class LSDDConfig:
         Stop coarsening when the next-level dimension is <= max_coarse.
     max_density : float
         Stop coarsening when the next-level operator density is >= max_density.
+    explore_theory : bool
+        If True, run optional exploratory theory/diagnostic hooks after the GEP
+        solve on each level. Intended for development; disabled by default.
+    explore_theory_aggs : tuple[int, ...] | None
+        Optional aggregate indices to run exploratory hooks on. If None, a small
+        default sample is chosen.
     """
 
     agg_levels: int
@@ -113,6 +119,9 @@ class LSDDConfig:
     max_levels: int
     max_coarse: int
     max_density: float
+
+    explore_theory: bool = False
+    explore_theory_aggs: tuple[int, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -206,16 +215,23 @@ class EigenInfo:
         Eigenvalue threshold used for selection when a fixed `nev` is not supplied.
     min_ev
         Minimum eigenvalue accepted across all aggregates on this level (for reporting).
+    eigvals
+        Optional list of length n_aggs storing accepted generalized eigenvalues per
+        aggregate, in the same local-column order used to append columns into P.
     """
 
     nev: IndexArray
     threshold: Optional[float] = None
     min_ev: float = float("inf")
+    eigvals: Optional[list[np.ndarray]] = None
 
     @classmethod
     def allocate(cls, n_aggs: int) -> "EigenInfo":
         """Allocate an EigenInfo container for n_aggs aggregates with `nev` initialized to zeros."""
-        return cls(nev=np.zeros(n_aggs, dtype=np.int32))
+        return cls(
+            nev=np.zeros(n_aggs, dtype=np.int32),
+            eigvals=[np.empty(0, dtype=float) for _ in range(n_aggs)],
+        )
 
 
 class LSDDLevel(Protocol):
@@ -242,3 +258,6 @@ class LSDDLevel(Protocol):
     # Set later during extension (assembly step)
     P: SparseLike
     R: SparseLike
+
+    # Row multiplicities for local outer products (stored for theory/diagnostics).
+    v_row_mult: np.ndarray

@@ -223,6 +223,8 @@ def least_squares_dd_solver_exp(
             max_levels=max_levels,
             max_coarse=max_coarse,
             max_density=max_density,
+            explore_theory=not True,
+            explore_theory_aggs=(0, ),   # or None for default sample
         )
 
         _lsdd_extend_hierarchy(
