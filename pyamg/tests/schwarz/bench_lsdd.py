@@ -1,18 +1,21 @@
-"""Benchmark LS–AMG–DD setup/solve on saved B matrices.
+"""Benchmark LS-AMG-DD reference "ref" and experimental "exp" solver implementations on saved matrices. 
 
-Run from pyamg/schwarz/ (your current working dir):
-  python ../tests/schwarz/bench_lsdd.py --data ../tests/schwarz/data --aggregate standard --coarsen 8 10
+Run from pyamg root:
+  python pyamg/tests/schwarz/bench_lsdd.py --data tests/schwarz/data --aggregate standard --coarsen 8 10 --solver ref
 
-Options:
-  --solver {ref,exp,both}   which solver(s) to run
-  --per-level              print per-level timing summaries (if present)
-  --csv out.csv            write a CSV summary
+Key options:
+  --solver {ref,exp,both}   run the reference and/or experimental solver
+  --robust_Sker_handling    exp only: robust local handling of kernel(S)
+  --force_row_closure       exp only: enforce row-closure in aggregation
+  --per-level               print per-level LS-DD timing/stats (if present)
+  --csv out.csv             write a CSV summary
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import re
 import time
 from pathlib import Path
 
@@ -52,9 +55,17 @@ def _run_one(
     tol: float,
     maxiter: int,
     restart: int,
-    per_level: bool,
-    **kwargs,
+    solver_kwargs: dict | None = None,
 ):
+    """Run one solver build+solve and return benchmark metrics.
+
+    solver_kwargs are forwarded only to the selected solver implementation.
+    Use this for solver-specific options so unsupported keywords are not
+    passed to other solver variants.
+    """
+    if solver_kwargs is None:
+        solver_kwargs = {}
+
     t0 = time.perf_counter()
     ml = solver_fn(
         B=B,
@@ -72,19 +83,27 @@ def _run_one(
         max_levels=max_levels,
         max_coarse=max_coarse,
         max_density=max_density,
-        print_info=False,  # keep bench output clean; use --per-level if desired
-        **kwargs
+        print_info=False,
+        **solver_kwargs,
     )
     setup_time = time.perf_counter() - t0
 
-    res: list[float] = []
-    M = ml.aspreconditioner(cycle="V")
+    residuals: list[float] = []
+    preconditioner = ml.aspreconditioner(cycle="V")
 
     t1 = time.perf_counter()
-    x, info = fgmres(A, b, tol=tol, restart=restart, maxiter=maxiter, M=M, residuals=res)
+    _, info = fgmres(
+        A,
+        b,
+        tol=tol,
+        restart=restart,
+        maxiter=maxiter,
+        M=preconditioner,
+        residuals=residuals,
+    )
     solve_time = time.perf_counter() - t1
 
-    iters, cf, final_res = _conv_factor(res)
+    iters, cf, final_res = _conv_factor(residuals)
 
 
     return dict(
@@ -100,37 +119,95 @@ def _run_one(
     )
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data", type=str, required=True, help="Directory containing B_n*.npz")
-    p.add_argument("--solver", choices=["ref", "exp", "both"], default="both")
-    p.add_argument("--aggregate", type=str, default="standard")
-    p.add_argument("--coarsen", type=int, nargs="+", default=[8, 10])
-    p.add_argument("--kappa", type=float, default=50.0)
-    p.add_argument("--nev", type=int, default=0, help="0 means None (threshold-based)")
-    p.add_argument("--max-levels", type=int, default=10)
-    p.add_argument("--max-coarse", type=int, default=10)
-    p.add_argument("--max-density", type=float, default=0.25)
-    p.add_argument("--tol", type=float, default=1e-8)
-    p.add_argument("--maxiter", type=int, default=100)
-    p.add_argument("--restart", type=int, default=100)
-    p.add_argument("--per-level", action="store_true")
-    p.add_argument("--csv", type=str, default="")
-    p.add_argument("--robust_Sker_handling", type=bool, default=False, help="exp only: Force robust handling of kernal of S")
-    p.add_argument("--force_row_closure", type=bool, default=False, help="exp only: Force closure of rows in aggregation")
-    args = p.parse_args()
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data", type=str, required=True, help="Directory containing B_n*.npz")
+    parser.add_argument("--solver", choices=["ref", "exp", "both"], default="both")
+    parser.add_argument("--aggregate", type=str, default="standard")
+    parser.add_argument("--coarsen", type=int, nargs="+", default=[8, 10])
+    parser.add_argument("--kappa", type=float, default=50.0)
+    parser.add_argument("--nev", type=int, default=0, help="0 means None (threshold-based)")
+    parser.add_argument("--max-levels", type=int, default=10)
+    parser.add_argument("--max-coarse", type=int, default=10)
+    parser.add_argument("--max-density", type=float, default=0.25)
+    parser.add_argument("--tol", type=float, default=1e-8)
+    parser.add_argument("--maxiter", type=int, default=100)
+    parser.add_argument("--restart", type=int, default=100)
+    parser.add_argument("--per-level", action="store_true")
+    parser.add_argument("--csv", type=str, default="")
+    parser.add_argument(
+        "--robust_Sker_handling",
+        type=bool,
+        default=False,
+        help="exp only: Force robust handling of kernel of S",
+    )
+    parser.add_argument(
+        "--force_row_closure",
+        type=bool,
+        default=False,
+        help="exp only: Force closure of rows in aggregation",
+    )
+    return parser.parse_args()
 
-    data_dir = Path(args.data)
-    import re
-    def _n_from_name(p: Path) -> int:
-        m = re.search(r"_n(\d+)$", p.stem)
-        return int(m.group(1)) if m else 0
+
+def _n_from_name(path: Path) -> int:
+    match = re.search(r"_n(\d+)$", path.stem)
+    return int(match.group(1)) if match else 0
+
+
+def _find_b_files(data_dir: Path) -> list[Path]:
     files = sorted(data_dir.glob("B_n*.npz"), key=_n_from_name)
-
-
     if not files:
         raise FileNotFoundError(f"No B_n*.npz found in {data_dir}")
-    
+    return files
+
+
+def _build_problem(B_file: Path) -> tuple[sparse.csr_matrix, sparse.csr_matrix, np.ndarray]:
+    B = sparse.load_npz(B_file).tocsr()
+    A = (B.T @ B).tocsr()
+    n = A.shape[0]
+    rng = np.random.default_rng(n)
+    b = rng.standard_normal(n)
+    return B, A, b
+
+
+def _iter_solvers(which: str):
+    # Import here so it uses your editable install cleanly.
+    from pyamg.schwarz.least_squares_dd import least_squares_dd_solver as pyamg_dd_ref
+    from pyamg.schwarz.least_squares_dd_exp import least_squares_dd_solver_exp as pyamg_dd_exp
+
+    if which in ("ref", "both"):
+        yield "ref", pyamg_dd_ref
+    if which in ("exp", "both"):
+        yield "exp", pyamg_dd_exp
+
+
+def _print_result(name: str, out: dict) -> None:
+    print(
+        f"{name:>3} | setup={out['setup_time']:.2f}s "
+        f"solve={out['solve_time']:.2f}s iters={out['iters']:3d} "
+        f"cf={out['conv_factor']:.3f} oc={out['oc']:.2f} final_res={out['final_res']:.2e}"
+    )
+
+
+def _print_per_level(ml) -> None:
+    from pyamg.schwarz.lsdd.stats import _lsdd_print_level_summary
+
+    printed = False
+    for level in ml.levels:
+        stats = getattr(level, "lsdd_stats", None)
+        if stats is None:
+            continue
+        if printed:
+            print("-" * 72)
+        printed = True
+        _lsdd_print_level_summary(stats, print_info=True, prefix="", indent="")
+
+
+def main() -> None:
+    args = _parse_args()
+    files = _find_b_files(Path(args.data))
+
     if args.per_level:
         print(
             "Legend: omega=|nonoverlapping aggregate|, OMEGA=|overlapping subdomain|, "
@@ -138,37 +215,27 @@ def main():
             "nev = # eigenvectors kept per aggregate. eig = eigenvalues kept (columns of P)."
         )
 
-
-    # Import here so it uses your editable install cleanly
-    from pyamg.schwarz.least_squares_dd import least_squares_dd_solver as pyamg_dd_ref
-    from pyamg.schwarz.least_squares_dd_exp import least_squares_dd_solver_exp as pyamg_dd_exp
-
-    solvers = []
-    if args.solver in ("ref", "both"):
-        solvers.append(("ref", pyamg_dd_ref))
-    if args.solver in ("exp", "both"):
-        solvers.append(("exp", pyamg_dd_exp))
-
+    solvers = list(_iter_solvers(args.solver))
     rows = []
+
     for f in files:
-        B = sparse.load_npz(f).tocsr()
-        A = (B.T @ B).tocsr()
+        B, A, b = _build_problem(f)
         n = A.shape[0]
-
-        rng = np.random.default_rng(n)
-        b = rng.standard_normal(n)
-
         nev = None if args.nev == 0 else args.nev
 
-
-        # Build kwargs for exp-only options; they will be ignored by the ref solver
-        exp_kwargs = dict( robust_Sker_handling = args.robust_Sker_handling, force_row_closure = args.force_row_closure )
+        # Options supported only by the experimental solver.
+        exp_kwargs = {
+            "robust_Sker_handling": args.robust_Sker_handling,
+            "force_row_closure": args.force_row_closure,
+        }
 
         print(f"\n=== {f.name} (n={n}) ===")
-        for name, fn in solvers:
+        for name, solver_fn in solvers:
+            # Pass exp-only options only to the experimental solver.
+            solver_kwargs = exp_kwargs if name == "exp" else None
             out = _run_one(
                 name,
-                fn,
+                solver_fn,
                 B=B,
                 A=A,
                 b=b,
@@ -182,48 +249,22 @@ def main():
                 tol=args.tol,
                 maxiter=args.maxiter,
                 restart=args.restart,
-                per_level=args.per_level,
-                **exp_kwargs
+                solver_kwargs=solver_kwargs,
             )
-            print(
-                f"{name:>3} | setup={out['setup_time']:.2f}s "
-                f"solve={out['solve_time']:.2f}s iters={out['iters']:3d} "
-                f"cf={out['conv_factor']:.3f} oc={out['oc']:.2f} final_res={out['final_res']:.2e}"
-            )
-            # Optional: per-level summaries if you’ve attached lsdd_stats to levels
-            from pyamg.schwarz.lsdd.stats import _lsdd_print_level_summary
-            # if args.per_level:
-            #     for lev in out['ml'].levels:
-            #         s = getattr(lev, "lsdd_stats", None)
-            #         if s is not None:
-            #             _lsdd_print_level_summary(s, print_info=True, prefix="", indent="")
+            _print_result(name, out)
 
             if args.per_level:
-                printed = False
-                for lev in out['ml'].levels:
-                    s = getattr(lev, "lsdd_stats", None)
-                    if s is None:
-                        continue
-                    if printed or s:
-                        print("" + "-" * 72)
-                    printed = True
-                    _lsdd_print_level_summary(s, print_info=True, prefix="", indent="")
+                _print_per_level(out["ml"])
 
-
-
-            row = dict(case=f.stem, n=n, **out)
-            rows.append(row)
-
-
+            rows.append(dict(case=f.stem, n=n, **out))
 
     if args.csv:
         with open(args.csv, "w", newline="") as fp:
-            w = csv.DictWriter(fp, fieldnames=rows[0].keys())
-            w.writeheader()
-            w.writerows(rows)
+            writer = csv.DictWriter(fp, fieldnames=rows[0].keys())
+            writer.writeheader()
+            writer.writerows(rows)
         print(f"\nWrote {args.csv}")
 
 
 if __name__ == "__main__":
     main()
-

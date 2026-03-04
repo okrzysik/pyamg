@@ -1,24 +1,22 @@
 """
-A/B comparison test: reference vs experimental least-squares DD solver.
+Comparison test: reference vs experimental least-squares DD solver.
 
-Data layout (your repo):
-  tests/schwarz/data/
-    B_n4225.npz
-    B_n16641.npz
-    B_n66049.npz
+Test cases are based on the B_n*.npz files from tests/schwarz/data, which contain sparse matrices
+B. Each test case loads B, forms A = B.T @ B, generates a random RHS b (length n), builds the
+multilevel solver, and uses it as a preconditioner for FGMRES.
+See also:
+    tests/schwarz/data/
+        B_n4225.npz
+        B_n16641.npz
+        B_n66049.npz
 
-Each test case loads B, forms A = B.T @ B, generates a random RHS b (length n),
-builds the multilevel solver, and uses it as a preconditioner for FGMRES.
-
-How to run from pyamg root (recommended, so you definitely use the active Python env):
-  PYAMG_LSDD_PRINT_INFO=1 pytest -q -s tests/schwarz/test_lsdd_compare.py
+How to run from pyamg root:
+  PYAMG_LSDD_PRINT_INFO=1 pytest -q -s pyamgtests/schwarz/test_lsdd_compare.py
 
 Optional knobs:
   PYAMG_LSDD_PRINT_INFO=1   -> passes print_info=True into the solver
   PYAMG_LSDD_PRINT_ML=1     -> prints the MultilevelSolver object (can be long)
   PYAMG_RUN_LARGE=1         -> includes the largest test case (n=66049); skipped by default since it can be slow
-
-NOTE to ME: This pyamg environment was installed within a firedrake virtual env, so that's what needs to be active to run this test. If you try to run it in a different environment, you'll likely get an ImportError.
 """
 
 from __future__ import annotations
@@ -53,6 +51,8 @@ except Exception:
 
 _HERE = Path(__file__).resolve().parent
 _DATA = _HERE / "data"
+_DEFAULT_COARSEN = [8, 10]
+_DEFAULT_AGGREGATE = "standard"
 
 
 def _extract_n(path: Path) -> int:
@@ -67,8 +67,9 @@ if not B_FILES:
 
 def _build_A_and_rhs(B: sparse.spmatrix, *, seed: int) -> tuple[sparse.csr_matrix, np.ndarray]:
     """
-    Build A = B^T B (CSR) and a random RHS b (length n).
-    Assumption (per user): A is SPD / nonsingular.
+    Build A = B^T B (CSR) and a deterministic random RHS b (length n).
+
+    The caller controls reproducibility through ``seed``.
     """
     B = B.tocsr()
     A = (B.T @ B).tocsr()
@@ -80,6 +81,30 @@ def _build_A_and_rhs(B: sparse.spmatrix, *, seed: int) -> tuple[sparse.csr_matri
     return A, b
 
 
+def _env_flag(name: str) -> bool:
+    """Read a bool flag from environment where \"1\" means True."""
+    return os.environ.get(name, "0") == "1"
+
+
+def _convergence_metrics(residuals: np.ndarray) -> tuple[int, float, float, float]:
+    """Return (iters, reduction_ratio, conv_factor, iters_to_0_1)."""
+    if residuals.size < 2:
+        return 0, float("nan"), float("nan"), float("nan")
+
+    # pyamg.krylov.fgmres stores a history; in practice it includes the initial residual.
+    iters = max(int(residuals.size - 1), 1)
+    ratio = float(residuals[-1] / residuals[0])
+    cf = float(np.exp(np.log(ratio) / iters)) if residuals[0] > 0.0 else float("nan")
+    iters_to_01 = float(np.log(0.1) / np.log(cf)) if (cf > 0.0 and cf < 1.0) else float("inf")
+    return iters, ratio, cf, iters_to_01
+
+
+def _skip_large_case_if_needed(n: int) -> None:
+    """Skip large matrix cases unless explicitly enabled by env var."""
+    if (n >= 50000) and (not _env_flag("PYAMG_RUN_LARGE")):
+        pytest.skip("Large case; set PYAMG_RUN_LARGE=1 to run")
+
+
 def _run_one(
     solver_fn,
     *,
@@ -89,11 +114,16 @@ def _run_one(
     min_coarsening: list[int],
     aggregate: str = "standard",
 ):
-    """Build solver, apply it as a preconditioner to FGMRES, return metrics."""
-    print_info = os.environ.get("PYAMG_LSDD_PRINT_INFO", "0") == "1"
-    print_ml = os.environ.get("PYAMG_LSDD_PRINT_ML", "0") == "1"
+    """Build one solver, run preconditioned FGMRES, and return benchmark metrics.
 
-    # --- setup
+    Environment toggles:
+    - PYAMG_LSDD_PRINT_INFO=1: enable solver setup logging.
+    - PYAMG_LSDD_PRINT_ML=1: print the multilevel hierarchy object.
+    """
+    print_info = _env_flag("PYAMG_LSDD_PRINT_INFO")
+    print_ml = _env_flag("PYAMG_LSDD_PRINT_ML")
+
+    # Setup multilevel hierarchy.
     t0 = time.perf_counter()
     ml = solver_fn(
         B=B,
@@ -118,9 +148,9 @@ def _run_one(
     if print_ml:
         print(ml)
 
-    # --- solve with preconditioned FGMRES
-    M = ml.aspreconditioner(cycle="V")
-    res: list[float] = []
+    # Solve with V-cycle preconditioned FGMRES.
+    preconditioner = ml.aspreconditioner(cycle="V")
+    residuals: list[float] = []
 
     t1 = time.perf_counter()
     x, info = fgmres(
@@ -129,23 +159,13 @@ def _run_one(
         tol=1e-8,
         restart=100,
         maxiter=100,
-        M=M,
-        residuals=res,
+        M=preconditioner,
+        residuals=residuals,
     )
     solve_time = time.perf_counter() - t1
 
-    res_arr = np.asarray(res, dtype=float)
-    if res_arr.size >= 2:
-        # pyamg.krylov.fgmres stores a history; in practice it includes the initial residual.
-        iters = max(int(res_arr.size - 1), 1)
-        ratio = float(res_arr[-1] / res_arr[0])
-        cf = float(np.exp(np.log(ratio) / iters)) if res_arr[0] > 0.0 else float("nan")
-        iters_to_01 = float(np.log(0.1) / np.log(cf)) if (cf > 0.0 and cf < 1.0) else float("inf")
-    else:
-        iters = 0
-        ratio = float("nan")
-        cf = float("nan")
-        iters_to_01 = float("nan")
+    res_arr = np.asarray(residuals, dtype=float)
+    iters, ratio, cf, iters_to_01 = _convergence_metrics(res_arr)
 
     oc = float(ml.operator_complexity())
 
@@ -165,6 +185,7 @@ def _run_one(
 
 
 def _print_summary(label: str, out: dict, *, coarsen: list[int]):
+    """Print a compact per-solver summary for one test case."""
     res = out["res"]
     final_res = float(res[-1]) if res.size else float("nan")
     init_res = float(res[0]) if res.size else float("nan")
@@ -185,18 +206,16 @@ def _print_summary(label: str, out: dict, *, coarsen: list[int]):
 
 @pytest.mark.parametrize("b_path", B_FILES, ids=[p.stem for p in B_FILES])
 def test_lsdd_ref_vs_exp_print_metrics(b_path: Path):
+    """Compare convergence quality of reference vs experimental LS-DD on one matrix."""
     B = sparse.load_npz(b_path).tocsr()
     n = B.shape[1]
+    _skip_large_case_if_needed(n)
 
-    run_large = os.environ.get("PYAMG_RUN_LARGE", "0") == "1"
-    if (n >= 50000) and (not run_large):
-        pytest.skip("Large case; set PYAMG_RUN_LARGE=1 to run")
-
-    # A is SPD (per your note), so random b is fine.
+    # Build a deterministic RHS for repeatable comparisons.
     A, b = _build_A_and_rhs(B, seed=n)  # deterministic per-size seed
 
-    coarsen = [8, 10]
-    aggregate = "standard"
+    coarsen = _DEFAULT_COARSEN
+    aggregate = _DEFAULT_AGGREGATE
 
     out_ref = _run_one(pyamg_dd_ref, B=B, A=A, b=b, min_coarsening=coarsen, aggregate=aggregate)
     out_exp = _run_one(pyamg_dd_exp, B=B, A=A, b=b, min_coarsening=coarsen, aggregate=aggregate)
