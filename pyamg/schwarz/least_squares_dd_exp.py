@@ -55,6 +55,8 @@ def least_squares_dd_solver_exp(
     filteringB: FilteringSpec | None = (False, 0.0),
     max_density: float = 0.1,
     print_info: bool = False,
+    force_row_closure: bool = False,
+    robust_Sker_handling: bool = True,
     **kwargs: Any,
 ) -> MultilevelSolver:
     """Build an LS–AMG–DD multilevel solver from a least-squares factor.
@@ -101,6 +103,11 @@ def least_squares_dd_solver_exp(
         Optional row-filtering controls of the form (lump_diagonal, theta).
     print_info
         Print per-level timing and size stats during setup.
+    force_row_closure
+        If True, forces the R_rows_i sets to be closed under adjacency in B, which can be helpful for robustness in some cases. This is False by default, and is not an option in the original implementation
+    robust_Sker_handling
+        If True, applies a robust handling strategy for kernel of SPSD Schur complements (infinite-eigenvalue modes) in the local GEPs. False by default, and not an option in the original implementation. If False, the kernel of the Schur complement is regualrized-away via an identity perturbation.
+        
     kwargs
         Forwarded to `MultilevelSolver`.
 
@@ -223,6 +230,8 @@ def least_squares_dd_solver_exp(
             max_levels=max_levels,
             max_coarse=max_coarse,
             max_density=max_density,
+            force_row_closure=force_row_closure,
+            robust_Sker_handling=robust_Sker_handling,
             explore_theory=not True,
             explore_theory_aggs=(0, ),   # or None for default sample
         )

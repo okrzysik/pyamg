@@ -99,6 +99,11 @@ class LSDDConfig:
         Stop coarsening when the next-level dimension is <= max_coarse.
     max_density : float
         Stop coarsening when the next-level operator density is >= max_density.
+    force_row_closure : bool
+        If True, forces the R_rows_i sets to be closed under adjacency in B, which can be helpful for robustness in some cases. This is False by default, and is not an option in the original implementation
+    robust_Sker_handling : bool
+        If True, applies a robust handling strategy for kernel of SPSD Schur complements (infinite-eigenvalue modes) in the local GEPs. False by default, and not an option in the original implementation. If False, the kernel of the Schur complement is regualrized-away via an identity perturbation.
+
     explore_theory : bool
         If True, run optional exploratory theory/diagnostic hooks after the GEP
         solve on each level. Intended for development; disabled by default.
@@ -120,6 +125,10 @@ class LSDDConfig:
     max_coarse: int
     max_density: float
 
+    force_row_closure: bool
+    robust_Sker_handling: bool
+
+    # Optional exploratory theory hooks (disabled by default)
     explore_theory: bool = False
     explore_theory_aggs: tuple[int, ...] | None = None
 

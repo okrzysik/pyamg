@@ -301,7 +301,7 @@ def _lsdd_extend_hierarchy(
 
     # ---- overlap construction + PoU ----
     with stats.timeit("overlap"):
-        _lsdd_build_overlap_and_pou(level=level, A=A, B=B, v_row_mult=v_row_mult, print_info=cfg.print_info)
+        _lsdd_build_overlap_and_pou(level=level, A=A, B=B, v_row_mult=v_row_mult, force_row_closure=cfg.force_row_closure, print_info=cfg.print_info)
 
 
     # ---- dense principal submatrices ----
@@ -334,6 +334,7 @@ def _lsdd_extend_hierarchy(
             counter = _lsdd_process_one_aggregate_gep(
                 i=i,
                 level=level,
+                robust_Sker_handling=cfg.robust_Sker_handling,
                 nev=cfg.nev,
                 min_coarsening=cfg.min_coarsening,
                 counter=counter,

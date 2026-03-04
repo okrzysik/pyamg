@@ -12,13 +12,16 @@ for diagnostics and default threshold choices.
 """
 
 from __future__ import annotations
+from re import sub
 
 from .types import LSDDLevel
 
 import numpy as np
 from scipy.sparse import csr_array
 
-def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, B, v_row_mult: np.ndarray, print_info: bool) -> None:
+def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, B, v_row_mult: np.ndarray, 
+                                force_row_closure: bool,
+                                print_info: bool) -> None:
     """Build omega/OMEGA/GAMMA, row sets, and PoU masks for all aggregates.
 
     Parameters
@@ -39,6 +42,9 @@ def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, B, v_row_mult: np.ndarra
     v_row_mult
         Array of shape (m,), updated in-place so that v_row_mult[r] counts how many
         aggregates include row r in their R_rows_i set.
+
+    force_row_closure
+        If True, forces the R_rows_i sets to be closed under adjacency in B, which can be helpful for robustness in some cases. This not an option in the original implementation.
 
     print_info
         If True, prints mean/max |OMEGA_i| and performs a lightweight PoU check.
@@ -95,6 +101,69 @@ def _lsdd_build_overlap_and_pou(*, level: LSDDLevel, A, B, v_row_mult: np.ndarra
         R_rows_i = np.unique(np.concatenate(rows, dtype=np.int32))
         sub.R_rows[i] = R_rows_i
         v_row_mult[R_rows_i] += 1
+
+
+        # --- IMPORTANT: ensure OMEGA_i is "row-closed" with respect to the selected B-rows ---
+        #
+        # What went wrong without this:
+        # -----------------------------
+        # We build:
+        #   - OMEGA_i from the graph of A (one-ring neighbors of omega_i), and
+        #   - R_rows_i as all B-rows that touch omega_i (via B^T column adjacency).
+        # Later, local Gram blocks are formed by restricting B to these indices:
+        #     B_loc = B[R_rows_i, :][:, OMEGA_i]
+        # and then taking weighted outer products / Schur complements.
+        #
+        # This implicitly assumes a *closure* property:
+        #     for every selected row r in R_rows_i, supp(B[r, :]) ⊆ OMEGA_i,
+        # i.e. that every nonzero in any selected row is retained in the column slice.
+        #
+        # If this is not true, then B_loc is NOT a true submatrix of B: some selected rows
+        # are silently *truncated* (columns outside OMEGA_i are dropped, i.e. treated as 0).
+        # That changes the local least-squares geometry and the local Schur complement S:
+        # interface variables can no longer cancel residual components that depend on the
+        # dropped DOFs, and expected near-kernel directions (e.g. constants on fully interior
+        # aggregates for diffusion-type Grams) disappear. Practically, this turns “infinite”
+        # eigenvalues into moderate ones and makes the dominant finite modes look like the
+        # next-smoothest shapes (often well fit by affine functions), which can be misleading.
+        #
+        # Why this can happen even when A = B^T B:
+        # ---------------------------------------
+        # The sparsity pattern of A is determined by column dot-products:
+        #     A_ij = Σ_r B_{r i} B_{r j}.
+        # Even if i and j co-occur in some row(s) of B, their dot-product can be EXACTLY zero
+        # (orthogonality / cancellations), so A_ij = 0 and the A-graph omits that adjacency.
+        # This is common in CG(1) diffusion assembled from element-gradient Grams: some pairs
+        # of local basis gradients can be orthogonal on an element, giving a zero stiffness
+        # coupling, even though the element-level B-row block touches both DOFs.
+        #
+        # Fix:
+        # ----
+        # After selecting R_rows_i, augment OMEGA_i by all columns touched by those rows:
+        #     OMEGA_i ← OMEGA_i ∪ (⋃_{r∈R_rows_i} supp(B[r,:])).
+        # This guarantees we never truncate selected rows and preserves the correct local
+        # LS projector / Schur complement structure. After this closure, fully interior
+        # aggregates recover the expected null/near-null directions; with our eps*I
+        # regularization of S, those show up as ~1/eps eigenvalues (finite proxies for
+        # the mathematically infinite eigenvalues of the unregularized pencil).
+        #
+        # --- end IMPORTANT ---
+
+        # --- NEW: close OMEGA_i under the supports of the selected B-rows ---
+        # Later we form local pieces using B[R_rows_i, :][:, OMEGA_i].
+        # If any selected row r has nonzeros in columns outside OMEGA_i, that row gets
+        # implicitly truncated, which can destroy expected near-kernel structure.
+        if force_row_closure:
+            cols = []
+            for r in R_rows_i:
+                cols.append(B.indices[B.indptr[r] : B.indptr[r + 1]])
+            if cols:
+                cols_i = np.unique(np.concatenate(cols, dtype=np.int32))
+                OMEGA_i = np.unique(np.concatenate((OMEGA_i, cols_i), dtype=np.int32))
+
+            sub.OMEGA[i] = OMEGA_i
+            sub.n_OMEGA[i] = OMEGA_i.size
+            # --- end NEW ---
 
         # incidence data for overlap diagnostics
         nodes_r.append(OMEGA_i)

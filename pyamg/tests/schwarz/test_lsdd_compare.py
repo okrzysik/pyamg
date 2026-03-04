@@ -10,7 +10,7 @@ Data layout (your repo):
 Each test case loads B, forms A = B.T @ B, generates a random RHS b (length n),
 builds the multilevel solver, and uses it as a preconditioner for FGMRES.
 
-How to run (recommended, so you definitely use the active Python env):
+How to run from pyamg root (recommended, so you definitely use the active Python env):
   PYAMG_LSDD_PRINT_INFO=1 pytest -q -s tests/schwarz/test_lsdd_compare.py
 
 Optional knobs:
@@ -18,7 +18,7 @@ Optional knobs:
   PYAMG_LSDD_PRINT_ML=1     -> prints the MultilevelSolver object (can be long)
   PYAMG_RUN_LARGE=1         -> includes the largest test case (n=66049); skipped by default since it can be slow
 
-NOTE: This pyamg environment was installed within a firedrake virtual env, so that's what needs to be active to run this test. If you try to run it in a different environment, you'll likely get an ImportError.
+NOTE to ME: This pyamg environment was installed within a firedrake virtual env, so that's what needs to be active to run this test. If you try to run it in a different environment, you'll likely get an ImportError.
 """
 
 from __future__ import annotations

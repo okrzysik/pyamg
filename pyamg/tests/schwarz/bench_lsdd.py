@@ -53,6 +53,7 @@ def _run_one(
     maxiter: int,
     restart: int,
     per_level: bool,
+    **kwargs,
 ):
     t0 = time.perf_counter()
     ml = solver_fn(
@@ -72,6 +73,7 @@ def _run_one(
         max_coarse=max_coarse,
         max_density=max_density,
         print_info=False,  # keep bench output clean; use --per-level if desired
+        **kwargs
     )
     setup_time = time.perf_counter() - t0
 
@@ -114,6 +116,8 @@ def main():
     p.add_argument("--restart", type=int, default=100)
     p.add_argument("--per-level", action="store_true")
     p.add_argument("--csv", type=str, default="")
+    p.add_argument("--robust_Sker_handling", type=bool, default=False, help="exp only: Force robust handling of kernal of S")
+    p.add_argument("--force_row_closure", type=bool, default=False, help="exp only: Force closure of rows in aggregation")
     args = p.parse_args()
 
     data_dir = Path(args.data)
@@ -156,6 +160,10 @@ def main():
 
         nev = None if args.nev == 0 else args.nev
 
+
+        # Build kwargs for exp-only options; they will be ignored by the ref solver
+        exp_kwargs = dict( robust_Sker_handling = args.robust_Sker_handling, force_row_closure = args.force_row_closure )
+
         print(f"\n=== {f.name} (n={n}) ===")
         for name, fn in solvers:
             out = _run_one(
@@ -175,6 +183,7 @@ def main():
                 maxiter=args.maxiter,
                 restart=args.restart,
                 per_level=args.per_level,
+                **exp_kwargs
             )
             print(
                 f"{name:>3} | setup={out['setup_time']:.2f}s "

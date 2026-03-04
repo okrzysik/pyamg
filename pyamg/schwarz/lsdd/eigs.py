@@ -41,6 +41,7 @@ def _lsdd_process_one_aggregate_gep(
     *,
     i: int,
     level: LSDDLevel,
+    robust_Sker_handling: bool,
     nev: int | None,
     min_coarsening: int | None,
     counter: int,
@@ -73,6 +74,9 @@ def _lsdd_process_one_aggregate_gep(
         Eigen-selection metadata:
         - `level.eigs.threshold` (float) and `level.eigs.min_ev` (float)
         - `level.eigs.nev` (int32 array length n_aggs)
+
+    robust_Sker_handling
+        If True, applies a robust handling strategy for kernel of SPSD Schur complements (infinite-eigenvalue modes) in the local GEPs. This is not an option in the original implementation. If False, the kernel of the Schur complement is regualrized-away via an identity perturbation.
 
     nev
         If not None: keep exactly the largest `nev` eigenpairs, additionally capped by
@@ -143,90 +147,270 @@ def _lsdd_process_one_aggregate_gep(
     bb_full = b_flat.reshape((b_dim, b_dim))
     _tadd("gep_unpack", perf_counter() - t0)
 
-    t0 = perf_counter()
-    # ---- regularize bb to avoid breakdowns in the Schur complement ----
-    # Use a cheap scale; avoid spectral norm (ord=2) which is SVD-cost.
-    bb_full = bb_full.copy()  # do not mutate the flattened storage
-    scale = float(np.linalg.norm(bb_full, ord="fro"))
-    eps = 1e-10 * scale if scale != 0.0 else 1e-10
-    #eps = 1e-3
+    
+    #  -------------------------------------------------------------------------
+    #  OLD: NON-robust handling of SPSD Schur complements 
+    #  -------------------------------------------------------------------------
+    if not robust_Sker_handling:
+        t0 = perf_counter()
+        # ---- regularize bb to avoid breakdowns in the Schur complement ----
+        # Use a cheap scale; avoid spectral norm (ord=2) which is SVD-cost.
+        bb_full = bb_full.copy()  # do not mutate the flattened storage
+        scale = float(np.linalg.norm(bb_full, ord="fro"))
+        eps = 1e-10 * scale if scale != 0.0 else 1e-10
+        # add eps*I without allocating an identity matrix
+        bb_full.flat[:: bb_full.shape[0] + 1] += eps
 
-    # add eps*I without allocating an identity matrix
-    bb_full.flat[:: bb_full.shape[0] + 1] += eps
-    _tadd("gep_regularize", perf_counter() - t0)
+        _tadd("gep_regularize", perf_counter() - t0)
 
-    t0 = perf_counter()
-    # ---- cap number of eigenpairs to keep (per aggregate) ----
-    omega_size_global = int(level.sub.n_omega[i])
-    max_keep = omega_size_global
-    if min_coarsening is not None:
-        max_keep = omega_size_global // int(min_coarsening)
+        t0 = perf_counter()
+        # ---- cap number of eigenpairs to keep (per aggregate) ----
+        omega_size_global = int(level.sub.n_omega[i])
+        max_keep = omega_size_global
+        if min_coarsening is not None:
+            max_keep = omega_size_global // int(min_coarsening)
 
-    if max_keep <= 0:
-        return counter
+        if max_keep <= 0:
+            return counter
 
-    # Restrict A to omega indices (indices are within OMEGA_i ordering)
-    aa = aa_full[np.ix_(omega, omega)]
-    if aa.shape[0] == 0:
-        return counter
+        # Restrict A to omega indices (indices are within OMEGA_i ordering)
+        aa = aa_full[np.ix_(omega, omega)]
+        if aa.shape[0] == 0:
+            return counter
 
-    max_keep = min(max_keep, aa.shape[0])
-    _tadd("gep_cap_and_restrict", perf_counter() - t0)
+        max_keep = min(max_keep, aa.shape[0])
+        _tadd("gep_cap_and_restrict", perf_counter() - t0)
 
-    t0 = perf_counter()
-    # ---- Schur complement of bb onto omega ----
-    if GAMMA.size == 0:
-        S = bb_full[np.ix_(omega, omega)]
-    else:
-        bb_GG = bb_full[np.ix_(GAMMA, GAMMA)]
-        bb_Go = bb_full[np.ix_(GAMMA, omega)]
-        # X = (bb_GG)^{-1} bb_Go
-        try:
-            c, lower = cho_factor(bb_GG, lower=True, check_finite=False)
-            X = cho_solve((c, lower), bb_Go, check_finite=False)
-        except LinAlgError:
-            X = np.linalg.solve(bb_GG, bb_Go)
-
-        S = bb_full[np.ix_(omega, omega)] - bb_full[np.ix_(omega, GAMMA)] @ X
-    _tadd("gep_schur", perf_counter() - t0)
-
-    t0 = perf_counter()
-    # ---- solve GEP; compute only the eigenpairs we could possibly keep ----
-    # `eigh(aa, S)` returns eigenvalues in nondecreasing order.
-    # We select exactly one of:
-    #   - subset_by_index: keep only the largest k eigenpairs (best when k is known/capped)
-    #   - subset_by_value: keep only eigenpairs with lambda >= thr (best in threshold mode)
-    nloc = S.shape[0]
-    subset_kwargs: dict[str, object] = {}
-
-    # If nev is set, we will keep at most `nev` eigenvectors (also capped by max_keep).
-    if nev is not None:
-        k = int(min(max_keep, nev))
-        k = max(1, min(k, nloc))
-        if k < nloc:
-            lo = nloc - k
-            hi = nloc - 1
-            subset_kwargs["subset_by_index"] = [lo, hi]
-
-    # Otherwise we are in threshold-selection mode.
-    else:
-        # If max_keep caps the number we could ever keep, subset by index is still best.
-        k = int(max_keep)
-        k = max(1, min(k, nloc))
-        if k < nloc:
-            lo = nloc - k
-            hi = nloc - 1
-            subset_kwargs["subset_by_index"] = [lo, hi]
+        t0 = perf_counter()
+        # ---- Schur complement of bb onto omega ----
+        if GAMMA.size == 0:
+            S = bb_full[np.ix_(omega, omega)]
         else:
-            # No cap: try to avoid computing small eigenpairs below the threshold.
-            subset_kwargs["subset_by_value"] = [float(thr), float("inf")]
+            bb_GG = bb_full[np.ix_(GAMMA, GAMMA)]
+            bb_Go = bb_full[np.ix_(GAMMA, omega)]
+            # X = (bb_GG)^{-1} bb_Go
+            try:
+                c, lower = cho_factor(bb_GG, lower=True, check_finite=False)
+                X = cho_solve((c, lower), bb_Go, check_finite=False)
+            except LinAlgError:
+                X = np.linalg.solve(bb_GG, bb_Go)
 
-    try:
-        E, V = eigh(aa, S, **subset_kwargs) if subset_kwargs else eigh(aa, S)
-    except TypeError:
-        # Older SciPy may not support subset selection -> fall back to full solve.
-        E, V = eigh(aa, S)
-    _tadd("gep_eigh", perf_counter() - t0)
+            S = bb_full[np.ix_(omega, omega)] - bb_full[np.ix_(omega, GAMMA)] @ X
+        _tadd("gep_schur", perf_counter() - t0)
+
+        t0 = perf_counter()
+        # ---- solve GEP; compute only the eigenpairs we could possibly keep ----
+        # `eigh(aa, S)` returns eigenvalues in nondecreasing order.
+        # We select exactly one of:
+        #   - subset_by_index: keep only the largest k eigenpairs (best when k is known/capped)
+        #   - subset_by_value: keep only eigenpairs with lambda >= thr (best in threshold mode)
+        nloc = S.shape[0]
+        subset_kwargs: dict[str, object] = {}
+
+        # If nev is set, we will keep at most `nev` eigenvectors (also capped by max_keep).
+        if nev is not None:
+            k = int(min(max_keep, nev))
+            k = max(1, min(k, nloc))
+            if k < nloc:
+                lo = nloc - k
+                hi = nloc - 1
+                subset_kwargs["subset_by_index"] = [lo, hi]
+
+        # Otherwise we are in threshold-selection mode.
+        else:
+            # If max_keep caps the number we could ever keep, subset by index is still best.
+            k = int(max_keep)
+            k = max(1, min(k, nloc))
+            if k < nloc:
+                lo = nloc - k
+                hi = nloc - 1
+                subset_kwargs["subset_by_index"] = [lo, hi]
+            else:
+                # No cap: try to avoid computing small eigenpairs below the threshold.
+                subset_kwargs["subset_by_value"] = [float(thr), float("inf")]
+
+        try:
+            E, V = eigh(aa, S, **subset_kwargs) if subset_kwargs else eigh(aa, S)
+        except TypeError:
+            # Older SciPy may not support subset selection -> fall back to full solve.
+            E, V = eigh(aa, S)
+        _tadd("gep_eigh", perf_counter() - t0)
+    # -------------------------------------------------------------------------
+    # END OLD: NON-robust handling of SPSD Schur complements 
+    # -------------------------------------------------------------------------
+
+
+    # -------------------------------------------------------------------------
+    # NEW: robust handling of SPSD Schur complements (infinite-eigenvalue modes)
+    # -------------------------------------------------------------------------
+    elif robust_Sker_handling: 
+        t0 = perf_counter()
+
+        # We do NOT regularize bb_full here.
+        # Regularizing bb_full (or S) with eps*I turns mathematically infinite eigenvalues
+        # (vectors in ker(S)) into huge-but-finite ~1/eps eigenvalues, and the associated
+        # eigenvectors become essentially arbitrary (basis depends on the perturbation).
+        bb_full = bb_full.copy()  # do not mutate flattened storage
+
+        # ---- cap number of eigenpairs to keep (per aggregate) ----
+        omega_size_global = int(level.sub.n_omega[i])
+        max_keep = omega_size_global
+        if min_coarsening is not None:
+            max_keep = omega_size_global // int(min_coarsening)
+
+        if max_keep <= 0:
+            return counter
+
+        # Restrict A to omega indices (indices are within OMEGA_i ordering)
+        aa = aa_full[np.ix_(omega, omega)]
+        if aa.shape[0] == 0:
+            return counter
+
+        max_keep = min(max_keep, aa.shape[0])
+
+        # Need threshold early (existing code uses it later)
+        thr = float(level.eigs.threshold)
+
+        _tadd("gep_cap_and_restrict", perf_counter() - t0)
+
+        t0 = perf_counter()
+
+        # ---- Schur complement of bb onto omega ----
+        # Note: this requires solving with bb_GG. bb_GG can be SPD even if the resulting
+        # Schur complement S is only SPSD.
+        if GAMMA.size == 0:
+            S = bb_full[np.ix_(omega, omega)]
+        else:
+            bb_GG = bb_full[np.ix_(GAMMA, GAMMA)]
+            bb_Go = bb_full[np.ix_(GAMMA, omega)]
+
+            # Solve bb_GG * X = bb_Go.
+            # If bb_GG is singular / near-singular, the Schur complement is not uniquely
+            # defined; in that rare case we add a *tiny* diagonal jitter to bb_GG only
+            # (much less invasive than shifting the whole bb_full).
+            try:
+                c, lower = cho_factor(bb_GG, lower=True, check_finite=False)
+            except LinAlgError:
+                bb_GG = bb_GG.copy()
+                scale_GG = float(np.linalg.norm(bb_GG, ord="fro"))
+                gg_jitter = 1e-12 * scale_GG if scale_GG != 0.0 else 1e-12
+                bb_GG.flat[:: bb_GG.shape[0] + 1] += gg_jitter
+                c, lower = cho_factor(bb_GG, lower=True, check_finite=False)
+
+            X = cho_solve((c, lower), bb_Go, check_finite=False)
+            S = bb_full[np.ix_(omega, omega)] - bb_full[np.ix_(omega, GAMMA)] @ X
+
+        # Symmetrize defensively (roundoff can introduce tiny skew)
+        S = 0.5 * (S + S.T)
+
+        _tadd("gep_schur", perf_counter() - t0)
+
+        t0 = perf_counter()
+
+        # ---- Split off the "infinite eigenvalue" subspace: ker(S) ----
+        # For the pencil (aa, S):
+        #   v in ker(S)   =>   lambda(v) = (v^T aa v)/(v^T S v) = +infty.
+        #
+        # SciPy's eigh(aa, S) requires S ≻ 0, so we do:
+        #   1) eigen-decompose S to detect its near-kernel,
+        #   2) include those vectors as +inf modes,
+        #   3) solve the finite problem on the orthogonal complement, where S is SPD.
+        sS, Q = eigh(S)  # returns ascending eigenvalues
+
+        # Tolerance for "near-zero" eigenvalues of S.
+        # Tune if needed; this scale-free choice works well in double precision.
+        smax = float(sS[-1]) if sS.size else 0.0
+        tolS = max(1e-12 * smax, 1e-14)
+
+        mask0 = sS <= tolS
+        Z = Q[:, mask0]          # near-kernel basis (omega-dofs)
+        Q2 = Q[:, ~mask0]        # orthogonal complement
+        d2 = sS[~mask0]          # strictly positive eigenvalues on complement
+
+        # Z vectors count toward max_keep (and toward nev, if nev is fixed).
+        zkeep = min(Z.shape[1], max_keep)
+        Z = Z[:, :zkeep]
+
+        # Remaining budget for finite eigenvectors
+        fin_budget = max_keep - Z.shape[1]
+        # If nev is fixed and we already filled it with nullspace vectors, no finite solve needed.
+        if nev is not None:
+            fin_budget = min(fin_budget, max(0, int(nev) - Z.shape[1]))
+
+        _tadd("gep_split_null", perf_counter() - t0)
+
+        t0 = perf_counter()
+
+        E_parts: list[np.ndarray] = []
+        V_parts: list[np.ndarray] = []
+
+        # ---- Finite part: solve on complement where S is SPD ----
+        if fin_budget > 0 and Q2.shape[1] > 0:
+            # Reduced matrices in the Q2 basis:
+            #   A2 = Q2^T aa Q2
+            #   S2 = diag(d2)  (since Q diagonalizes S)
+            A2 = Q2.T @ aa @ Q2
+            A2 = 0.5 * (A2 + A2.T)  # defensively symmetrize
+
+            inv_sqrt_d2 = 1.0 / np.sqrt(d2)
+
+            # Convert generalized eigenproblem (A2 x = lambda diag(d2) x)
+            # to standard SPD eigenproblem:
+            #   (D^{-1/2} A2 D^{-1/2}) y = lambda y, with y = D^{1/2} x.
+            Ahat = inv_sqrt_d2[:, None] * A2 * inv_sqrt_d2[None, :]
+            Ahat = 0.5 * (Ahat + Ahat.T)
+
+            n2 = Ahat.shape[0]
+            k_fin = int(min(fin_budget, n2))
+
+            if k_fin > 0:
+                subset_kwargs: dict[str, object] = {}
+                if k_fin < n2:
+                    subset_kwargs["subset_by_index"] = [n2 - k_fin, n2 - 1]  # take largest k_fin
+
+                try:
+                    E_fin, Y = eigh(Ahat, **subset_kwargs) if subset_kwargs else eigh(Ahat)
+                except TypeError:
+                    # Older SciPy fallback: compute full, then slice
+                    E_all, Y_all = eigh(Ahat)
+                    E_fin = E_all[-k_fin:]
+                    Y = Y_all[:, -k_fin:]
+
+                # Lift eigenvectors back to omega space:
+                #   x = D^{-1/2} y
+                #   v = Q2 x
+                X_fin = inv_sqrt_d2[:, None] * Y
+                V_fin = Q2 @ X_fin
+
+                E_parts.append(np.asarray(E_fin, dtype=float))
+                V_parts.append(V_fin)
+
+        # ---- Infinite part: append +inf eigenvalues with basis Z ----
+        if Z.shape[1] > 0:
+            E_inf = np.full(Z.shape[1], np.inf, dtype=float)
+            #E_inf = np.full(Z.shape[1], 1e8, dtype=float)
+            E_parts.append(E_inf)
+            V_parts.append(Z)
+
+        # Combine into E (ascending) and V (matching columns)
+        if E_parts:
+            E = np.concatenate(E_parts, axis=0)
+            V = np.concatenate(V_parts, axis=1)
+
+            # Ensure ascending order (finite first, +inf last); safe even if empty/degenerate.
+            order = np.argsort(E)
+            E = E[order]
+            V = V[:, order]
+        else:
+            # Should not happen for nonempty omega, but keep it safe.
+            E = np.empty((0,), dtype=float)
+            V = np.empty((aa.shape[0], 0), dtype=float)
+
+        _tadd("gep_eigs", perf_counter() - t0)
+    # ------------------------------------------------------------------------------
+    # END NEW: robust handling of SPSD Schur complements (infinite-eigenvalue modes)
+    # ------------------------------------------------------------------------------
+
 
     t0 = perf_counter()
     # Map local omega indices -> global row indices for insertion into P
@@ -239,19 +423,85 @@ def _lsdd_process_one_aggregate_gep(
     thr = float(level.eigs.threshold)
     _tadd("gep_map_rows", perf_counter() - t0)
 
+    # # ---- selection + triplet insertion ----
+    # if nev is not None:
+    #     t0 = perf_counter()
+    #     keep = min(int(nev), max_keep)
+    #     if keep <= 0:
+    #         return counter
+
+    #     # E is increasing; keep the largest `keep`
+    #     E_keep = E[-keep:]
+    #     V_keep = V[:, -keep:]
+    #     _tadd("gep_select", perf_counter() - t0)
+
+    #     t0 = perf_counter()
+    #     if eigvals_kept is not None:
+    #         eigvals_kept.extend([float(x) for x in E_keep])
+
+    #     # Persist per-aggregate accepted eigenvalues in the same order that
+    #     # local basis columns are appended into P for this aggregate.
+    #     if level.eigs.eigvals is not None:
+    #         level.eigs.eigvals[i] = np.asarray(E_keep, dtype=float)
+
+    #     # Track minimum kept eigenvalue across all aggregates
+    #     min_kept = float(E_keep[0])
+    #     level.eigs.min_ev = min(level.eigs.min_ev, min_kept)
+    #     level.eigs.nev[i] = keep
+
+    #     for j in range(keep):
+    #         p_r.append(global_rows)
+    #         p_c.append(np.full(global_rows.shape[0], counter, dtype=np.int32))
+    #         p_v.append(V_keep[:, j])
+    #         counter += 1
+    #     _tadd("gep_triplets", perf_counter() - t0)
+
+    #     return counter
+
+
     # ---- selection + triplet insertion ----
     if nev is not None:
         t0 = perf_counter()
-        keep = min(int(nev), max_keep)
-        if keep <= 0:
+
+        # Target number of vectors (still capped by max_keep)
+        keep_target = min(int(nev), max_keep)
+        if keep_target <= 0:
             return counter
 
-        # E is increasing; keep the largest `keep`
-        E_keep = E[-keep:]
-        V_keep = V[:, -keep:]
+        # Identify "infinite eigenvalue" modes (from ker(S) handling).
+        # Even if E has no +inf entries (old code path), this is harmless.
+        inf_mask = np.isinf(E)
+        inf_idx = np.flatnonzero(inf_mask)      # positions of +inf eigenpairs
+        fin_idx = np.flatnonzero(~inf_mask)     # positions of finite eigenpairs
+
+        # Always keep all +inf modes (subject to max_keep), even if nev is smaller.
+        # Rationale: these correspond to the unregularized pencil's infinite eigenvalues
+        # (vectors in ker(S)), i.e. structural coarse modes. Dropping them because nev
+        # is small is usually undesirable.
+        n_inf = min(inf_idx.size, max_keep)
+        keep_target = max(keep_target, n_inf)
+        keep_target = min(keep_target, max_keep)
+
+        rem = keep_target - n_inf
+
+        # Fill remaining budget with the largest finite eigenpairs.
+        # Note: SciPy's eigh returns eigenvalues in increasing order, so the largest
+        # finite ones are at the end of fin_idx. We reverse to store them in descending
+        # order (consistent with the threshold-mode insertion loop).
+        if rem > 0 and fin_idx.size > 0:
+            fin_take = fin_idx[-rem:][::-1]
+        else:
+            fin_take = np.empty(0, dtype=int)
+
+        # Final keep ordering: +inf first, then finite (descending)
+        idx_keep = np.concatenate([inf_idx[:n_inf], fin_take])
+
+        E_keep = E[idx_keep]
+        V_keep = V[:, idx_keep]
+
         _tadd("gep_select", perf_counter() - t0)
 
-        t0 = perf_counter()
+        # Diagnostics / reporting
         if eigvals_kept is not None:
             eigvals_kept.extend([float(x) for x in E_keep])
 
@@ -260,12 +510,16 @@ def _lsdd_process_one_aggregate_gep(
         if level.eigs.eigvals is not None:
             level.eigs.eigvals[i] = np.asarray(E_keep, dtype=float)
 
-        # Track minimum kept eigenvalue across all aggregates
-        min_kept = float(E_keep[0])
-        level.eigs.min_ev = min(level.eigs.min_ev, min_kept)
-        level.eigs.nev[i] = keep
+        # Update min_ev using only FINITE eigenvalues (min_ev is for reporting).
+        finite_kept = E_keep[np.isfinite(E_keep)]
+        if finite_kept.size:
+            level.eigs.min_ev = min(level.eigs.min_ev, float(np.min(finite_kept)))
 
-        for j in range(keep):
+        level.eigs.nev[i] = int(E_keep.size)
+
+        # Insert columns into P in the same order as E_keep: +inf first.
+        t0 = perf_counter()
+        for j in range(V_keep.shape[1]):
             p_r.append(global_rows)
             p_c.append(np.full(global_rows.shape[0], counter, dtype=np.int32))
             p_v.append(V_keep[:, j])
@@ -273,6 +527,7 @@ def _lsdd_process_one_aggregate_gep(
         _tadd("gep_triplets", perf_counter() - t0)
 
         return counter
+
 
     # threshold-based selection from largest downwards
     t0 = perf_counter()
