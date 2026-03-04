@@ -11,7 +11,7 @@ See also:
         B_n66049.npz
 
 How to run from pyamg root:
-  PYAMG_LSDD_PRINT_INFO=1 pytest -q -s pyamgtests/schwarz/test_lsdd_compare.py
+  PYAMG_LSDD_PRINT_INFO=1 pytest -q -s pyamg/tests/schwarz/test_lsdd_compare.py
 
 Optional knobs:
   PYAMG_LSDD_PRINT_INFO=1   -> passes print_info=True into the solver
