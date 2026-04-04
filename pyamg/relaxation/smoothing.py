@@ -34,6 +34,7 @@ from scipy.sparse.linalg import LinearOperator
 from ..util.utils import scale_rows, get_block_diag, get_diagonal
 from ..util.linalg import approximate_spectral_radius
 from ..krylov import gmres, cgne, cgnr, cg
+from .. import amg_core
 from . import relaxation
 from .chebyshev import chebyshev_polynomial_coefficients
 
@@ -423,6 +424,59 @@ def rho_D_inv_A(A):
     return A.rho_D_inv
 
 
+def rho_additive_schwarz_A(A, subdomain, subdomain_ptr, inv_subblock, inv_subblock_ptr):
+    """Return the (approx.) spectral radius of M^-1 @ A for additive Schwarz.
+
+    Here M^-1 is the assembled additive Schwarz preconditioner defined by the
+    supplied subdomains and local inverse blocks.
+    """
+    cache = getattr(A, "_rho_additive_schwarz_cache", None)
+    if cache is None:
+        cache = {}
+        A._rho_additive_schwarz_cache = cache
+
+    key = (
+        id(subdomain),
+        id(subdomain_ptr),
+        id(inv_subblock),
+        id(inv_subblock_ptr),
+    )
+    if key in cache:
+        return cache[key]
+
+    nsdomains = int(subdomain_ptr.shape[0] - 1)
+    row_start, row_stop, row_step = 0, nsdomains, 1
+
+    def matvec(v):
+        v = np.asarray(v).reshape(-1)
+        Av = np.asarray(A @ v).reshape(-1)
+        xcorr = np.zeros_like(Av)
+        amg_core.overlapping_asm(
+            xcorr,
+            Av,
+            inv_subblock,
+            inv_subblock_ptr,
+            subdomain,
+            subdomain_ptr,
+            nsdomains,
+            row_start,
+            row_stop,
+            row_step,
+        )
+        return xcorr
+
+    op = LinearOperator(
+        shape=A.shape,
+        matvec=matvec,
+        dtype=np.result_type(A.dtype, inv_subblock.dtype),
+    )
+    rho = float(approximate_spectral_radius(op))
+    if not np.isfinite(rho) or rho <= 0.0:
+        raise ValueError(f"Estimated spectral radius for additive Schwarz must be positive, got {rho!r}")
+    cache[key] = rho
+    return rho
+
+
 def rho_block_D_inv_A(A, Dinv):
     """Return the (approx.) spectral radius of block D^-1 @ A.
 
@@ -572,7 +626,8 @@ def setup_strength_based_schwarz(lvl, iterations=DEFAULT_NITER,
 
 
 def setup_additive_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
-                  subdomain_ptr=None, inv_subblock=None, inv_subblock_ptr=None):
+                  subdomain_ptr=None, inv_subblock=None, inv_subblock_ptr=None,
+                  omega=1.0, withrho=False):
     """Set up Schwarz."""
     matrix_asformat(lvl, 'A', 'csr')
     lvl.Acsr.sort_indices()
@@ -580,12 +635,22 @@ def setup_additive_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
         relaxation.schwarz_parameters(lvl.Acsr, subdomain, subdomain_ptr,
                                       inv_subblock, inv_subblock_ptr)
 
+    if withrho:
+        omega = omega/rho_additive_schwarz_A(
+            lvl.Acsr,
+            subdomain,
+            subdomain_ptr,
+            inv_subblock,
+            inv_subblock_ptr,
+        )
+
     def smoother(A, x, b):
         relaxation.additive_schwarz(lvl.Acsr, x, b, iterations=iterations,
                                     subdomain=subdomain,
                                     subdomain_ptr=subdomain_ptr,
                                     inv_subblock=inv_subblock,
-                                    inv_subblock_ptr=inv_subblock_ptr)
+                                    inv_subblock_ptr=inv_subblock_ptr,
+                                    omega=omega)
     update_wrapper(smoother, relaxation.additive_schwarz)  # set __name__
     return smoother
 
