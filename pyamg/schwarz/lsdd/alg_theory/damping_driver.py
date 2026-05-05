@@ -1,27 +1,25 @@
 """Block-Jacobi damping sweep diagnostics for LS-DD algebraic theory.
 
 This module implements the numerical stage focused on damping dependence for
-block Jacobi, using a *normalized* damping coordinate ``zeta`` in ``(0, 2)``
+block Jacobi, using a normalized damping coordinate ``zeta_norm`` in ``(0, 2)``
 defined by
 
-``zeta = zeta_eff * N_AJ``.
+``zeta_norm = zeta_raw / N_AJ``.
 
-Equivalently, the effective damping used by the smoother is
+Here ``zeta_raw`` is the raw scalar passed to ASM as ``omega``.
 
-``zeta_eff = zeta / N_AJ``.
-
-For a fixed coarse space and a sweep of ``zeta``, the driver computes only the
+For a fixed coarse space and a sweep of ``zeta_norm``, the driver computes only the
 quantities needed for damping optimization studies:
 
 - Whole-space and restricted spectral edges: ``N_AJ`` and ``N_AJ_perp``.
-- Scalar sandwich models as functions of the normalized ``zeta``:
-  - ``L_J(zeta) = 1 / (zeta_eff * (2 - zeta_eff * N_AJ_perp))``
-  - ``U_J(zeta) = 1 / (zeta_eff * (2 - zeta_eff * N_AJ))``
-    with ``zeta_eff = zeta / N_AJ``.
+- Scalar sandwich models as functions of ``zeta_norm``:
+  - ``L_J(zeta_norm) = 1 / (zeta_raw * (2 - zeta_raw * N_AJ_perp))``
+  - ``U_J(zeta_norm) = 1 / (zeta_raw * (2 - zeta_raw * N_AJ))``
+    with ``zeta_raw = zeta_norm / N_AJ``.
 - Sampled restricted sharp target:
-  - ``Phi_J(zeta) = N_{tilde(J_zeta),J}^perp``
+  - ``Phi_J(zeta_norm) = N_{tilde(J_zeta),J}^perp``
 - Observed two-grid quantities from actual solver runs:
-  - ``q_obs(zeta)``, ``K_obs(zeta)``, ``rho_obs(zeta)``.
+  - ``q_obs(zeta_norm)``, ``K_obs(zeta_norm)``, ``rho_obs(zeta_norm)``.
 
 The implementation intentionally avoids computing unrelated refined-chain terms
 for performance.
@@ -29,20 +27,20 @@ for performance.
 
 from __future__ import annotations
 
+from functools import partial
 from time import perf_counter
 from warnings import warn
 
 import numpy as np
 
-from .linalg import factor_dense_spd as _factor_dense_spd
-from .linalg import solve_factored_dense_spd as _solve_factored_dense_spd
 from .models import DampingSweepConfig, DampingSweepResult
 from .observed import build_observed_two_level_solver as _build_observed_two_level_solver
 from .observed import estimate_qobs_homogeneous_two_grid as _estimate_qobs_homogeneous_two_grid
-from .operators import apply_B_block_jacobi as _apply_B_block_jacobi
+from .operators import apply_QJ as _apply_QJ
 from .operators import apply_tildeM as _apply_tildeM
+from .operators import apply_WJ_numerator_operator as _apply_WJ_numerator_operator
 from .operators import assemble_block_jacobi_matrix as _assemble_block_jacobi_matrix
-from .operators import build_block_jacobi_solver_from_matrix as _build_block_jacobi_solver_from_matrix
+from .operators import assemble_block_jacobi_solver as _assemble_block_jacobi_solver
 from .operators import build_linear_solver as _build_linear_solver
 from .operators import build_tilde_metric_ops as _build_tilde_metric_ops
 from .reporting import fmt_sig as _fmt_sig
@@ -51,28 +49,28 @@ from .setup import build_one_level_lsdd as _build_one_level_lsdd
 from .setup import extract_level_diagnostics as _extract_level_diagnostics
 from .setup import prepare_local_projection_blocks as _prepare_local_projection_blocks
 from .spectral import draw_random_vector as _draw_random_vector
-from .spectral import lobpcg_MinvOp as _lobpcg_MinvOp
-from .spectral import power_iteration_AinvB as _power_iteration_AinvB
-from .spectral import power_MinvOp as _power_MinvOp
-from .spectral import projected_power_perp_MinvOp as _projected_power_perp_MinvOp
+from .spectral import lobpcg_metric_inverse_operator as _lobpcg_metric_inverse_operator
+from .spectral import power_metric_inverse_operator as _power_metric_inverse_operator
+from .spectral import power_generalized_eigen_matrix_free as _power_generalized_eigen_matrix_free
+from .spectral import power_metric_inverse_operator_projected as _power_metric_inverse_operator_projected
 
 
-def _zeta_grid_from_config(cfg: DampingSweepConfig) -> np.ndarray:
-    """Return validated normalized damping grid in ``(0, 2)``."""
-    if cfg.zeta_values is not None:
-        zeta = np.asarray(cfg.zeta_values, dtype=float).reshape(-1)
+def _zeta_norm_grid_from_config(cfg: DampingSweepConfig) -> np.ndarray:
+    """Return validated normalized damping grid ``zeta_norm`` in ``(0, 2)``."""
+    if cfg.zeta_norm_values is not None:
+        zeta = np.asarray(cfg.zeta_norm_values, dtype=float).reshape(-1)
         if zeta.size == 0:
-            raise ValueError("zeta_values must contain at least one value")
+            raise ValueError("zeta_norm_values must contain at least one value")
     else:
         n = int(cfg.n_zeta)
         if n <= 0:
             raise ValueError("n_zeta must be positive")
-        zmin = float(cfg.zeta_min)
-        zmax = float(cfg.zeta_max)
+        zmin = float(cfg.zeta_norm_min)
+        zmax = float(cfg.zeta_norm_max)
         if not (0.0 < zmin < 2.0 and 0.0 < zmax < 2.0):
-            raise ValueError("zeta_min and zeta_max must lie strictly in (0, 2)")
+            raise ValueError("zeta_norm_min and zeta_norm_max must lie strictly in (0, 2)")
         if zmax <= zmin:
-            raise ValueError("zeta_max must be greater than zeta_min")
+            raise ValueError("zeta_norm_max must be greater than zeta_norm_min")
         zeta = np.linspace(zmin, zmax, n, dtype=float)
 
     if np.any(~np.isfinite(zeta)):
@@ -120,7 +118,7 @@ def compute_block_jacobi_damping_sweep(
         LS-DD setup path forms it from ``B`` and ``BT``.
     cfg
         Sweep configuration. The grid is interpreted as normalized damping
-        values in ``(0, 2)`` with ``zeta = zeta_eff * N_AJ``.
+        values ``zeta_norm`` in ``(0, 2)`` with ``zeta_raw = zeta_norm / N_AJ``.
     print_constants, constant_sig_digits
         Optional formatted diagnostics printout.
     print_timers
@@ -129,14 +127,14 @@ def compute_block_jacobi_damping_sweep(
     Returns
     -------
     DampingSweepResult
-        Arrays for ``L_J/U_J/Phi_J`` and observed ``q/K/rho`` over the zeta
-        grid, along with one-shot spectral-edge estimates and optimizer
+        Arrays for ``L_J/U_J/Phi_J`` and observed ``q/K/rho`` over the
+        normalized damping grid, along with one-shot spectral-edge estimates and optimizer
         summaries.
     """
     timers: dict[str, float] | None = {} if (cfg.collect_timers or print_timers) else None
     t_total = perf_counter()
 
-    zeta_vals = _zeta_grid_from_config(cfg)
+    zeta_norm_vals = _zeta_norm_grid_from_config(cfg)
     sp = cfg.solver_params
 
     t_stage = perf_counter()
@@ -167,8 +165,6 @@ def compute_block_jacobi_damping_sweep(
     _timer_add(timers, "stage.setup_level_sec", perf_counter() - t_stage)
 
     A_csr = level.A.tocsr()
-    P = level.P.tocsr()
-    P_T = P.T.tocsr()
     n_fine = int(A_csr.shape[0])
 
     t_stage = perf_counter()
@@ -179,21 +175,12 @@ def compute_block_jacobi_damping_sweep(
 
     t_stage = perf_counter()
     J = _assemble_block_jacobi_matrix(local_blocks=local_blocks, n_fine=n_fine, dtype=A_csr.dtype)
-    MP = (J @ P).tocsr()
-    C_M = (P_T @ MP).toarray()
-    C_M = 0.5 * (C_M + C_M.T)
-    C_M_sys = _factor_dense_spd(C_M)
-    solve_J = _build_block_jacobi_solver_from_matrix(J=J, local_blocks=local_blocks)
+    solve_J = _assemble_block_jacobi_solver(local_blocks=local_blocks, n_fine=n_fine)
     _timer_add(timers, "stage.build_block_jacobi_ops_sec", perf_counter() - t_stage)
 
     def apply_J(x: np.ndarray) -> np.ndarray:
         return np.asarray(J @ x).reshape(-1)
-
-    def apply_QJ(x: np.ndarray) -> np.ndarray:
-        y = np.asarray(J @ x).reshape(-1)
-        rhs = np.asarray(P_T @ y).reshape(-1)
-        alpha = _solve_factored_dense_spd(C_M_sys, rhs)
-        return np.asarray(x).reshape(-1) - np.asarray(P @ alpha).reshape(-1)
+    apply_QJ = partial(_apply_QJ, local_blocks=local_blocks, n_fine=n_fine)
 
     t_stage = perf_counter()
     seed = cfg.seed
@@ -201,18 +188,16 @@ def compute_block_jacobi_damping_sweep(
     N_AJ_estimator_used = str(cfg.N_AJ_estimator)
     if cfg.N_AJ_estimator == "lobpcg":
         try:
-            N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _lobpcg_MinvOp(
-                A=A_csr,
-                J=J,
-                solve_J=solve_J,
+            N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _lobpcg_metric_inverse_operator(
+                operator_matrix=A_csr,
+                metric_matrix=J,
+                solve_metric=solve_J,
                 n=n_fine,
                 block_size=int(cfg.N_AJ_block_size),
                 maxiter=int(cfg.maxiter_N_AJ),
                 tol=float(cfg.tol_N_AJ),
                 distribution=cfg.distribution,
                 seed=N_AJ_seed,
-                Y=None,
-                apply_QM_for_residual=None,
                 timers=timers,
                 timer_prefix="N_AJ.",
             )
@@ -222,10 +207,10 @@ def compute_block_jacobi_damping_sweep(
                 RuntimeWarning,
             )
             N_AJ_estimator_used = "power_fallback"
-            N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _power_MinvOp(
-                apply_op=lambda x: np.asarray(A_csr @ x).reshape(-1),
-                apply_J=apply_J,
-                solve_J=solve_J,
+            N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _power_metric_inverse_operator(
+                apply_operator=lambda x: np.asarray(A_csr @ x).reshape(-1),
+                apply_metric=apply_J,
+                solve_metric=solve_J,
                 n=n_fine,
                 dtype=A_csr.dtype,
                 maxiter=int(cfg.maxiter_N_AJ),
@@ -237,10 +222,10 @@ def compute_block_jacobi_damping_sweep(
                 timer_prefix="N_AJ.",
             )
     else:
-        N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _power_MinvOp(
-            apply_op=lambda x: np.asarray(A_csr @ x).reshape(-1),
-            apply_J=apply_J,
-            solve_J=solve_J,
+        N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _power_metric_inverse_operator(
+            apply_operator=lambda x: np.asarray(A_csr @ x).reshape(-1),
+            apply_metric=apply_J,
+            solve_metric=solve_J,
             n=n_fine,
             dtype=A_csr.dtype,
             maxiter=int(cfg.maxiter_N_AJ),
@@ -256,60 +241,30 @@ def compute_block_jacobi_damping_sweep(
     t_stage = perf_counter()
     N_AJ_perp_seed = None if seed is None else int(seed) + 17
     N_AJ_perp_estimator_used = str(cfg.N_AJ_perp_estimator)
+    N_AJ_perp_vec: np.ndarray | None = None
     if cfg.N_AJ_perp_estimator == "lobpcg":
-        try:
-            N_AJ_perp, N_AJ_perp_hist, N_AJ_perp_rel_hist, N_AJ_perp_abs_res_hist, N_AJ_perp_rel_res_hist, N_AJ_perp_conv = _lobpcg_MinvOp(
-                A=A_csr,
-                J=J,
-                solve_J=solve_J,
-                n=n_fine,
-                block_size=int(cfg.N_AJ_perp_block_size),
-                maxiter=int(cfg.maxiter_N_AJ_perp),
-                tol=float(cfg.tol_N_AJ_perp),
-                distribution=cfg.distribution,
-                seed=N_AJ_perp_seed,
-                Y=P,
-                apply_QM_for_residual=apply_QJ,
-                timers=timers,
-                timer_prefix="N_AJ_perp.",
-            )
-        except Exception as exc:
-            warn(
-                f"LOBPCG N_AJ_perp estimation failed ({exc!r}); falling back to projected power iteration.",
-                RuntimeWarning,
-            )
-            N_AJ_perp_estimator_used = "power_fallback"
-            N_AJ_perp, N_AJ_perp_hist, N_AJ_perp_rel_hist, N_AJ_perp_abs_res_hist, N_AJ_perp_rel_res_hist, N_AJ_perp_conv = _projected_power_perp_MinvOp(
-                apply_op=lambda x: np.asarray(A_csr @ x).reshape(-1),
-                apply_QM=apply_QJ,
-                apply_J=apply_J,
-                solve_J=solve_J,
-                n=n_fine,
-                dtype=A_csr.dtype,
-                maxiter=int(cfg.maxiter_N_AJ_perp),
-                tol=float(cfg.tol_N_AJ_perp),
-                miniter=int(cfg.miniter_N_AJ_perp),
-                distribution=cfg.distribution,
-                seed=N_AJ_perp_seed,
-                timers=timers,
-                timer_prefix="N_AJ_perp.",
-            )
-    else:
-        N_AJ_perp, N_AJ_perp_hist, N_AJ_perp_rel_hist, N_AJ_perp_abs_res_hist, N_AJ_perp_rel_res_hist, N_AJ_perp_conv = _projected_power_perp_MinvOp(
-            apply_op=lambda x: np.asarray(A_csr @ x).reshape(-1),
-            apply_QM=apply_QJ,
-            apply_J=apply_J,
-            solve_J=solve_J,
-            n=n_fine,
-            dtype=A_csr.dtype,
-            maxiter=int(cfg.maxiter_N_AJ_perp),
-            tol=float(cfg.tol_N_AJ_perp),
-            miniter=int(cfg.miniter_N_AJ_perp),
-            distribution=cfg.distribution,
-            seed=N_AJ_perp_seed,
-            timers=timers,
-            timer_prefix="N_AJ_perp.",
+        warn(
+            "N_AJ_perp_estimator='lobpcg' is unsupported with sparse coarse constraints; "
+            "using projected power iteration instead.",
+            RuntimeWarning,
         )
+        N_AJ_perp_estimator_used = "power_projected_forced"
+    N_AJ_perp, N_AJ_perp_hist, N_AJ_perp_rel_hist, N_AJ_perp_abs_res_hist, N_AJ_perp_rel_res_hist, N_AJ_perp_conv, N_AJ_perp_vec = _power_metric_inverse_operator_projected(
+        apply_operator=lambda x: np.asarray(A_csr @ x).reshape(-1),
+        apply_projector=apply_QJ,
+        apply_metric=apply_J,
+        solve_metric=solve_J,
+        n=n_fine,
+        dtype=A_csr.dtype,
+        maxiter=int(cfg.maxiter_N_AJ_perp),
+        tol=float(cfg.tol_N_AJ_perp),
+        miniter=int(cfg.miniter_N_AJ_perp),
+        distribution=cfg.distribution,
+        seed=N_AJ_perp_seed,
+        return_vector=True,
+        timers=timers,
+        timer_prefix="N_AJ_perp.",
+    )
     _timer_add(timers, "stage.N_AJ_perp_total_sec", perf_counter() - t_stage)
 
     tau, mu_max = _extract_level_diagnostics(level)
@@ -321,7 +276,7 @@ def compute_block_jacobi_damping_sweep(
         t_stage = perf_counter()
 
         def apply_BJ(x: np.ndarray) -> tuple[np.ndarray, float]:
-            return _apply_B_block_jacobi(
+            return _apply_WJ_numerator_operator(
                 x=x,
                 local_blocks=local_blocks,
                 n_fine=n_fine,
@@ -341,10 +296,10 @@ def compute_block_jacobi_damping_sweep(
             distribution=cfg.distribution,
             dtype=A_csr.dtype,
         )
-        lam_wj, _rel_wj, _an_wj, conv_wj = _power_iteration_AinvB(
-            A=A_csr,
-            apply_B=apply_BJ,
-            solve_A=solve_A,
+        lam_wj, _rel_wj, _an_wj, conv_wj = _power_generalized_eigen_matrix_free(
+            metric_matrix=A_csr,
+            apply_numerator=apply_BJ,
+            solve_metric=solve_A,
             x0=x0,
             maxiter=int(cfg.maxiter_W_J),
             tol=float(cfg.tol_W_J),
@@ -358,40 +313,40 @@ def compute_block_jacobi_damping_sweep(
             W_J_iters = int(lam_wj.size)
         _timer_add(timers, "stage.W_J_total_sec", perf_counter() - t_stage)
 
-    zeta_eff_vals = np.asarray(zeta_vals / float(N_AJ), dtype=float)
+    zeta_raw_vals = np.asarray(zeta_norm_vals / float(N_AJ), dtype=float)
 
-    zeta_low_raw = None
+    zeta_norm_low_raw = None
     if float(N_AJ_perp) > 0.0 and np.isfinite(float(N_AJ_perp)):
-        zeta_low_raw = float(float(N_AJ) / float(N_AJ_perp))
-    zeta_max_sampled = float(np.max(zeta_vals))
-    zeta_low_clip = None if zeta_low_raw is None else float(min(zeta_low_raw, zeta_max_sampled))
+        zeta_norm_low_raw = float(float(N_AJ) / float(N_AJ_perp))
+    zeta_norm_max_sampled = float(np.max(zeta_norm_vals))
+    zeta_norm_low_clip = None if zeta_norm_low_raw is None else float(min(zeta_norm_low_raw, zeta_norm_max_sampled))
 
-    zeta_low = zeta_low_raw
-    zeta_up = 1.0
+    zeta_norm_low = zeta_norm_low_raw
+    zeta_norm_up = 1.0
 
-    z = zeta_eff_vals
+    z = zeta_raw_vals
     den_L = z * (2.0 - z * float(N_AJ_perp))
     den_U = z * (2.0 - z * float(N_AJ))
     L_J = np.where(den_L > 0.0, 1.0 / den_L, np.inf)
     U_J = np.where(den_U > 0.0, 1.0 / den_U, np.inf)
 
-    Phi_J = np.full(zeta_vals.shape, np.nan, dtype=float)
-    phi_conv = np.zeros(zeta_vals.shape, dtype=bool)
-    phi_iters = np.zeros(zeta_vals.shape, dtype=np.int32)
-    phi_last_rel = np.full(zeta_vals.shape, np.nan, dtype=float)
-    phi_last_abs_res = np.full(zeta_vals.shape, np.nan, dtype=float)
-    phi_last_rel_res = np.full(zeta_vals.shape, np.nan, dtype=float)
+    Phi_J = np.full(zeta_norm_vals.shape, np.nan, dtype=float)
+    phi_conv = np.zeros(zeta_norm_vals.shape, dtype=bool)
+    phi_iters = np.zeros(zeta_norm_vals.shape, dtype=np.int32)
+    phi_last_rel = np.full(zeta_norm_vals.shape, np.nan, dtype=float)
+    phi_last_abs_res = np.full(zeta_norm_vals.shape, np.nan, dtype=float)
+    phi_last_rel_res = np.full(zeta_norm_vals.shape, np.nan, dtype=float)
 
     if bool(cfg.estimate_phi):
         t_stage = perf_counter()
-        for i, zeta_eff in enumerate(zeta_eff_vals):
-            if float(zeta_vals[i]) >= 2.0:
+        for i, zeta_raw in enumerate(zeta_raw_vals):
+            if float(zeta_norm_vals[i]) >= 2.0:
                 continue
             try:
                 tilde_ops = _build_tilde_metric_ops(
                     A_csr=A_csr,
                     J=J,
-                    zeta_eff=float(zeta_eff),
+                    zeta_eff=float(zeta_raw),
                     h_solve=cfg.h_solve,
                     h_cg_rtol=float(cfg.h_cg_rtol),
                     h_cg_atol=float(cfg.h_cg_atol),
@@ -401,11 +356,11 @@ def compute_block_jacobi_damping_sweep(
                 def apply_tilde_metric(x: np.ndarray) -> np.ndarray:
                     return _apply_tildeM(x=x, M=tilde_ops.M_damped, solve_H=tilde_ops.solve_H)
 
-                phi, hist, rel_hist, abs_res_hist, rel_res_hist, conv = _projected_power_perp_MinvOp(
-                    apply_op=apply_tilde_metric,
-                    apply_QM=apply_QJ,
-                    apply_J=apply_J,
-                    solve_J=solve_J,
+                phi, hist, rel_hist, abs_res_hist, rel_res_hist, conv = _power_metric_inverse_operator_projected(
+                    apply_operator=apply_tilde_metric,
+                    apply_projector=apply_QJ,
+                    apply_metric=apply_J,
+                    solve_metric=solve_J,
                     n=n_fine,
                     dtype=A_csr.dtype,
                     maxiter=int(cfg.maxiter_Phi),
@@ -413,6 +368,7 @@ def compute_block_jacobi_damping_sweep(
                     miniter=int(cfg.miniter_Phi),
                     distribution=cfg.distribution,
                     seed=None if seed is None else int(seed) + 10000 + i,
+                    x0=N_AJ_perp_vec,
                     timers=timers,
                     timer_prefix=f"Phi[{i}].",
                 )
@@ -427,28 +383,25 @@ def compute_block_jacobi_damping_sweep(
                     phi_last_rel_res[i] = float(rel_res_hist[-1])
             except Exception as exc:
                 warn(
-                    f"Phi_J estimation failed at normalized zeta={float(zeta_vals[i]):.6g} ({exc!r}); storing NaN.",
+                    f"Phi_J estimation failed at zeta_norm={float(zeta_norm_vals[i]):.6g} ({exc!r}); storing NaN.",
                     RuntimeWarning,
                 )
         _timer_add(timers, "stage.Phi_total_sec", perf_counter() - t_stage)
 
-    q_obs = np.full(zeta_vals.shape, np.nan, dtype=float)
-    K_obs = np.full(zeta_vals.shape, np.nan, dtype=float)
-    rho_obs = np.full(zeta_vals.shape, np.nan, dtype=float)
+    q_obs = np.full(zeta_norm_vals.shape, np.nan, dtype=float)
+    K_obs = np.full(zeta_norm_vals.shape, np.nan, dtype=float)
+    rho_obs = np.full(zeta_norm_vals.shape, np.nan, dtype=float)
 
     if bool(cfg.estimate_observed):
         t_stage = perf_counter()
-        for i, zeta_eff in enumerate(zeta_eff_vals):
+        for i, zeta_raw in enumerate(zeta_raw_vals):
             try:
                 ml_obs = _build_observed_two_level_solver(
                     B=B,
                     A=A,
                     BT=BT,
                     solver_params=sp,
-                    zeta=float(zeta_eff),
-                    with_rho=False,
-                    with_rho_perp=False,
-                    zeta_eff=float(zeta_eff),
+                    zeta_raw=float(zeta_raw),
                 )
                 q_i, K_i = _estimate_qobs_homogeneous_two_grid(
                     ml=ml_obs,
@@ -466,13 +419,20 @@ def compute_block_jacobi_damping_sweep(
                     K_obs[i] = float(K_i)
             except Exception as exc:
                 warn(
-                    f"Observed solve failed at normalized zeta={float(zeta_vals[i]):.6g} ({exc!r}); storing NaN.",
+                    f"Observed solve failed at zeta_norm={float(zeta_norm_vals[i]):.6g} ({exc!r}); storing NaN.",
                     RuntimeWarning,
                 )
         _timer_add(timers, "stage.observed_total_sec", perf_counter() - t_stage)
 
-    zeta_exact = _argmin_finite(zeta_vals, Phi_J)
-    zeta_best_K_obs = _argmin_finite(zeta_vals, K_obs)
+    zeta_norm_exact = _argmin_finite(zeta_norm_vals, Phi_J)
+    zeta_norm_best_K_obs = _argmin_finite(zeta_norm_vals, K_obs)
+
+    zeta_raw_low = None if zeta_norm_low is None else float(zeta_norm_low / float(N_AJ))
+    zeta_raw_up = None if zeta_norm_up is None else float(zeta_norm_up / float(N_AJ))
+    zeta_raw_exact = None if zeta_norm_exact is None else float(zeta_norm_exact / float(N_AJ))
+    zeta_raw_best_K_obs = (
+        None if zeta_norm_best_K_obs is None else float(zeta_norm_best_K_obs / float(N_AJ))
+    )
 
     _timer_add(timers, "stage.total_sec", perf_counter() - t_total)
 
@@ -486,31 +446,20 @@ def compute_block_jacobi_damping_sweep(
         print(f"  mu_max                  : {_fmt_sig(mu_max, sd)}")
         print("Damping normalization:")
         print("  N_AJ definition         : rho(J^{-1} A)")
-        print("  zeta_eff definition     : zeta / N_AJ = zeta / rho(J^{-1} A)")
-        print("  stable range            : zeta in (0, 2)")
-        print("Predicted/sampled optima:")
-        print(f"  zeta_low_raw            : {_fmt_sig(zeta_low_raw, sd)}")
-        print(f"  zeta_low_clip           : {_fmt_sig(zeta_low_clip, sd)}")
-        print(f"  zeta_up                 : {_fmt_sig(zeta_up, sd)}")
-        print(f"  zeta_exact (argmin Phi) : {_fmt_sig(zeta_exact, sd)}")
-        print(f"  zeta_best_K_obs         : {_fmt_sig(zeta_best_K_obs, sd)}")
-        print("Effective optima (for smoother omega):")
-        print(
-            f"  zeta_low_eff            : "
-            f"{_fmt_sig(None if zeta_low is None else zeta_low / float(N_AJ), sd)}"
-        )
-        print(
-            f"  zeta_up_eff             : "
-            f"{_fmt_sig(None if zeta_up is None else zeta_up / float(N_AJ), sd)}"
-        )
-        print(
-            f"  zeta_exact_eff          : "
-            f"{_fmt_sig(None if zeta_exact is None else zeta_exact / float(N_AJ), sd)}"
-        )
-        print(
-            f"  zeta_best_K_obs_eff     : "
-            f"{_fmt_sig(None if zeta_best_K_obs is None else zeta_best_K_obs / float(N_AJ), sd)}"
-        )
+        print("  zeta_raw definition     : ASM omega (raw parsed value)")
+        print("  zeta_norm definition    : zeta_raw / N_AJ")
+        print("  stable range            : zeta_norm in (0, 2)")
+        print("Predicted/sampled optima (normalized):")
+        print(f"  zeta_norm_low_raw       : {_fmt_sig(zeta_norm_low_raw, sd)}")
+        print(f"  zeta_norm_low_clip      : {_fmt_sig(zeta_norm_low_clip, sd)}")
+        print(f"  zeta_norm_up            : {_fmt_sig(zeta_norm_up, sd)}")
+        print(f"  zeta_norm_exact         : {_fmt_sig(zeta_norm_exact, sd)}")
+        print(f"  zeta_norm_best_K_obs    : {_fmt_sig(zeta_norm_best_K_obs, sd)}")
+        print("Predicted/sampled optima (raw ASM omega):")
+        print(f"  zeta_raw_low            : {_fmt_sig(zeta_raw_low, sd)}")
+        print(f"  zeta_raw_up             : {_fmt_sig(zeta_raw_up, sd)}")
+        print(f"  zeta_raw_exact          : {_fmt_sig(zeta_raw_exact, sd)}")
+        print(f"  zeta_raw_best_K_obs     : {_fmt_sig(zeta_raw_best_K_obs, sd)}")
         print("Spectral-edge solver diagnostics:")
         print(
             f"  N_AJ                    : method={N_AJ_estimator_used}, "
@@ -530,21 +479,96 @@ def compute_block_jacobi_damping_sweep(
             n_phi_ok = int(np.isfinite(Phi_J).sum())
             n_phi_conv = int(phi_conv.sum())
             print("Phi_J sweep diagnostics:")
-            print(f"  samples (finite)        : {n_phi_ok}/{zeta_vals.size}")
-            print(f"  converged               : {n_phi_conv}/{zeta_vals.size}")
+            print(f"  samples (finite)        : {n_phi_ok}/{zeta_norm_vals.size}")
+            print(f"  converged               : {n_phi_conv}/{zeta_norm_vals.size}")
 
     if print_timers and timers is not None:
-        print("Timing breakdown (seconds):")
-        for key in sorted(timers, key=timers.get, reverse=True):
-            val = timers[key]
-            if key.endswith("n_iter") or key.endswith("n_cycle"):
-                print(f"  {key}: {int(round(val))}")
-            else:
-                print(f"  {key}: {val:.6g}")
+        sec_items = {k: float(v) for k, v in timers.items() if k.endswith("_sec")}
+        count_items = {
+            k: int(round(float(v)))
+            for k, v in timers.items()
+            if k.endswith("n_iter") or k.endswith("n_cycle")
+        }
+
+        def _aggregate_indexed(items: dict[str, float], prefix: str) -> dict[str, float]:
+            out: dict[str, float] = {}
+            pfx = f"{prefix}["
+            for k, v in items.items():
+                if not k.startswith(pfx):
+                    continue
+                marker = "]."
+                j = k.find(marker)
+                if j < 0:
+                    continue
+                tail = k[j + len(marker) :]
+                out[tail] = float(out.get(tail, 0.0) + float(v))
+            return out
+
+        def _indexed_counts(items: dict[str, int], prefix: str, suffix: str) -> np.ndarray:
+            vals = [int(v) for k, v in items.items() if k.startswith(f"{prefix}[") and k.endswith(suffix)]
+            return np.asarray(vals, dtype=np.int32)
+
+        print("Timing summary:")
+        total = sec_items.get("stage.total_sec", None)
+        if total is not None:
+            print(f"  total_sec: {total:.6g}")
+
+        stage_items = {
+            k: v
+            for k, v in sec_items.items()
+            if k.startswith("stage.") and k != "stage.total_sec"
+        }
+        if stage_items:
+            print("Stage times (seconds):")
+            for key in sorted(stage_items, key=stage_items.get, reverse=True):
+                print(f"  {key}: {stage_items[key]:.6g}")
+
+        phi_sec = _aggregate_indexed(sec_items, "Phi")
+        obs_sec = _aggregate_indexed(sec_items, "obs")
+        other_sec = {
+            k: v
+            for k, v in sec_items.items()
+            if not k.startswith("stage.") and not k.startswith("Phi[") and not k.startswith("obs[")
+        }
+
+        if phi_sec or obs_sec or other_sec:
+            print("Kernel totals (seconds):")
+            for key in sorted(phi_sec, key=phi_sec.get, reverse=True):
+                print(f"  Phi.{key}: {phi_sec[key]:.6g}")
+            for key in sorted(obs_sec, key=obs_sec.get, reverse=True):
+                print(f"  obs.{key}: {obs_sec[key]:.6g}")
+            for key in sorted(other_sec, key=other_sec.get, reverse=True):
+                print(f"  {key}: {other_sec[key]:.6g}")
+
+        if count_items:
+            print("Work counters:")
+            for key in ("N_AJ.n_iter", "N_AJ_perp.n_iter", "W_J.power.n_iter"):
+                if key in count_items:
+                    print(f"  {key}: {count_items[key]}")
+
+            phi_iters = _indexed_counts(count_items, "Phi", ".n_iter")
+            if phi_iters.size:
+                print(
+                    "  Phi.n_iter (per-zeta): "
+                    f"total={int(phi_iters.sum())}, "
+                    f"min={int(np.min(phi_iters))}, "
+                    f"med={int(np.median(phi_iters))}, "
+                    f"max={int(np.max(phi_iters))}"
+                )
+
+            obs_cycles = _indexed_counts(count_items, "obs", ".n_cycle")
+            if obs_cycles.size:
+                print(
+                    "  obs.n_cycle (per-zeta): "
+                    f"total={int(obs_cycles.sum())}, "
+                    f"min={int(np.min(obs_cycles))}, "
+                    f"med={int(np.median(obs_cycles))}, "
+                    f"max={int(np.max(obs_cycles))}"
+                )
 
     return DampingSweepResult(
-        zeta_values=np.asarray(zeta_vals, dtype=float),
-        zeta_effective_values=np.asarray(zeta_eff_vals, dtype=float),
+        zeta_norm_values=np.asarray(zeta_norm_vals, dtype=float),
+        zeta_raw_values=np.asarray(zeta_raw_vals, dtype=float),
         N_AJ=float(N_AJ),
         N_AJ_perp=float(N_AJ_perp),
         tau=tau,
@@ -552,13 +576,17 @@ def compute_block_jacobi_damping_sweep(
         W_J=W_J,
         W_J_converged=W_J_conv,
         W_J_n_iterations=W_J_iters,
-        zeta_max_sampled=zeta_max_sampled,
-        zeta_low_raw=zeta_low_raw,
-        zeta_low_clip=zeta_low_clip,
-        zeta_low=zeta_low,
-        zeta_up=zeta_up,
-        zeta_exact=zeta_exact,
-        zeta_best_K_obs=zeta_best_K_obs,
+        zeta_norm_max_sampled=zeta_norm_max_sampled,
+        zeta_norm_low_raw=zeta_norm_low_raw,
+        zeta_norm_low_clip=zeta_norm_low_clip,
+        zeta_norm_low=zeta_norm_low,
+        zeta_norm_up=zeta_norm_up,
+        zeta_norm_exact=zeta_norm_exact,
+        zeta_norm_best_K_obs=zeta_norm_best_K_obs,
+        zeta_raw_low=zeta_raw_low,
+        zeta_raw_up=zeta_raw_up,
+        zeta_raw_exact=zeta_raw_exact,
+        zeta_raw_best_K_obs=zeta_raw_best_K_obs,
         L_J=np.asarray(L_J, dtype=float),
         U_J=np.asarray(U_J, dtype=float),
         Phi_J=np.asarray(Phi_J, dtype=float),

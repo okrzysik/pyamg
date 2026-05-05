@@ -13,10 +13,22 @@ The package is split by responsibility:
 
 from __future__ import annotations
 
-from . import damping_driver, exact_driver, linalg, models, observed, operators, reporting, setup, spectral
+from . import (
+    damping_driver,
+    damping_obs_sweep,
+    exact_driver,
+    linalg,
+    models,
+    observed,
+    operators,
+    reporting,
+    setup,
+    spectral,
+)
 
 __all__ = [
     "damping_driver",
+    "damping_obs_sweep",
     "exact_driver",
     "models",
     "setup",

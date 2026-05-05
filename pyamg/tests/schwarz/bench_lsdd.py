@@ -1,7 +1,7 @@
 """Benchmark LS-AMG-DD reference "ref" and experimental "exp" solver implementations on saved matrices. 
 
 Run from pyamg root:
-  python pyamg/tests/schwarz/bench_lsdd.py --data tests/schwarz/data --aggregate standard --coarsen 8 10 --solver ref
+  python pyamg/tests/schwarz/bench_lsdd.py --data pyamg/tests/schwarz/data --aggregate standard --coarsen 8 10 --solver ref
 
 Key options:
   --solver {ref,exp,both}   run the reference and/or experimental solver

@@ -19,13 +19,16 @@ smoothers
     Translation of shorthand smoother names to `change_smoothers` specs.
 stats
     Per-level timing and diagnostic reporting.
+alg_theory
+    Theory-focused drivers and design notes.
 """
 
 from __future__ import annotations
 
-from . import aggregation, eigs, hierarchy, local_ops, stats, smoothers, subdomains
+from . import alg_theory, aggregation, eigs, hierarchy, local_ops, smoothers, stats, subdomains, two_lvl_theory
 
 __all__ = [
+    "alg_theory",
     "aggregation",
     "subdomains",
     "local_ops",
@@ -33,4 +36,5 @@ __all__ = [
     "hierarchy",
     "smoothers",
     "stats",
+    "two_lvl_theory",
 ]

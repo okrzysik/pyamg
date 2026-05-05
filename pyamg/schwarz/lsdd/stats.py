@@ -112,6 +112,7 @@ def _lsdd_finalize_level_stats(*, stats, level: LSDDLevel, eigvals_kept, n_coars
     omega_sizes = sub.n_omega
     OMEGA_sizes = sub.n_OMEGA
     nev_arr = eigs.nev
+    first_discarded = eigs.first_discarded
 
 
     if omega_sizes is not None:
@@ -126,6 +127,12 @@ def _lsdd_finalize_level_stats(*, stats, level: LSDDLevel, eigvals_kept, n_coars
 
     if nev_arr is not None:
         _store_mmx(stats.extra, "nev", nev_arr)
+
+    if first_discarded is not None:
+        fd = np.asarray(first_discarded, dtype=float)
+        fd = fd[~np.isnan(fd)]
+        if fd.size:
+            _store_mmx(stats.extra, "eig_disc", fd)
 
     if eigvals_kept:
         ev = np.asarray(eigvals_kept, dtype=float)
@@ -197,22 +204,24 @@ def _lsdd_print_level_summary(
     print(f"{indent}       OMEGA : {_mmx(stats.extra, 'OMEGA')}")
 
 
-    print(f"{indent}     outerprod:")
-    print(f"{indent}       nnz_r (min/med/max) : {_mmx(stats.extra['outerprod'], 'nnz_r')}")
-    print(f"{indent}       sum(nnz_r**2)          : {_fmt(stats.extra['outerprod']['nnz_r_sqsum'])}")
+    # print(f"{indent}     outerprod:")
+    # print(f"{indent}       nnz_r (min/med/max) : {_mmx(stats.extra['outerprod'], 'nnz_r')}")
+    # print(f"{indent}       sum(nnz_r**2)          : {_fmt(stats.extra['outerprod']['nnz_r_sqsum'])}")
 
-    if "pou_rel_error" in stats.extra:
-        print(f"{indent}       PoU err: {_fmt(stats.extra['pou_rel_error'])}")
+    # if "pou_rel_error" in stats.extra:
+    #     print(f"{indent}       PoU err: {_fmt(stats.extra['pou_rel_error'])}")
 
 
     eig = "n/a"
     if all(k in stats.extra for k in ("eig_min", "eig_med", "eig_max")):
         eig = f"{_fmt(stats.extra['eig_min'])}/{_fmt(stats.extra['eig_med'])}/{_fmt(stats.extra['eig_max'])}"
 
-    print(f"{indent}     coarse:")
-    print(f"{indent}       nev   : {_mmx(stats.extra, 'nev')}")
-    print(f"{indent}       eig   : {eig}")
-    print(f"{indent}       thr   : {_fmt(stats.extra.get('thr', 'n/a'))}")
+    if stats.extra.get("nev") is not None:
+        print(f"{indent}     coarse:")
+        print(f"{indent}       nev   : {_mmx(stats.extra, 'nev')}")
+        print(f"{indent}       eig   : {eig}")
+        print(f"{indent}       eig_d : {_mmx(stats.extra, 'eig_disc')}")
+        print(f"{indent}       thr   : {_fmt(stats.extra.get('thr', 'n/a'))}")
 
     # Optional RAS profile block (only if timing keys exist)
     ras_keys = [k for k in stats.timings if k.startswith("ras_")]
@@ -269,27 +278,27 @@ def _lsdd_print_level_summary(
             total += v
             print(f"{indent}       {k:<11} {_fmt_ms(v)}")
 
-        # Print individual pieces for outerprod
-        if k == "outerprod":
-            sub = sorted(kk for kk in stats.timings if kk.startswith("outerprod_"))
-            for kk in sub:
-                # printed but not included in `total`
-                print(f"{indent}         {kk[10:]:<11} {_fmt_ms(stats.timings[kk])}")
+        # # Print individual pieces for outerprod
+        # if k == "outerprod":
+        #     sub = sorted(kk for kk in stats.timings if kk.startswith("outerprod_"))
+        #     for kk in sub:
+        #         # printed but not included in `total`
+        #         print(f"{indent}         {kk[10:]:<11} {_fmt_ms(stats.timings[kk])}")
 
-        # Print individual pieces for gep
-        if k == "gep":
-            sub = sorted(kk for kk in stats.timings if kk.startswith("gep_"))
-            for kk in sub:
-                # printed but not included in `total`
-                print(f"{indent}         {kk[4:]:<11} {_fmt_ms(stats.timings[kk])}")
+        # # Print individual pieces for gep
+        # if k == "gep":
+        #     sub = sorted(kk for kk in stats.timings if kk.startswith("gep_"))
+        #     for kk in sub:
+        #         # printed but not included in `total`
+        #         print(f"{indent}         {kk[4:]:<11} {_fmt_ms(stats.timings[kk])}")
 
 
-        # Print individual pieces for coarsening
-        if k == "coarsen":
-            sub = sorted(kk for kk in stats.timings if kk.startswith("coarsen_"))
-            for kk in sub:
-                # printed but not included in `total`
-                print(f"{indent}         {kk[8:]:<11} {_fmt_ms(stats.timings[kk])}")
+        # # Print individual pieces for coarsening
+        # if k == "coarsen":
+        #     sub = sorted(kk for kk in stats.timings if kk.startswith("coarsen_"))
+        #     for kk in sub:
+        #         # printed but not included in `total`
+        #         print(f"{indent}         {kk[8:]:<11} {_fmt_ms(stats.timings[kk])}")
 
     print(f"{indent}       {'total':<11} {_fmt_ms(total)}")
 

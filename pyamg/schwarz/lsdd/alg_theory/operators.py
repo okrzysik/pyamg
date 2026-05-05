@@ -9,66 +9,54 @@ from scipy.linalg import cho_solve
 from scipy.sparse import csr_array
 from scipy.sparse.linalg import cg, factorized
 
-from pyamg.relaxation import relaxation as relax
-
 from .linalg import factor_dense_spd, solve_factored_dense_spd
 from .models import ASolveMethod, DenseSPDSystem, LocalProjectionBlock, TildeMetricOps, TildeProjectionMode
 
 
-def flatten_subdomains_from_local_blocks(
-    local_blocks: list[LocalProjectionBlock],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Flatten omega-subdomains into Schwarz ``(subdomain, subdomain_ptr)`` arrays."""
-    ptr = np.zeros(len(local_blocks) + 1, dtype=np.int32)
-    chunks: list[np.ndarray] = []
-    for i, blk in enumerate(local_blocks):
-        idx = np.asarray(blk.omega_rows, dtype=np.int32).ravel()
-        idx = np.sort(idx)
-        chunks.append(idx)
-        ptr[i + 1] = ptr[i] + int(idx.size)
-    flat = np.concatenate(chunks).astype(np.int32, copy=False) if chunks else np.zeros(0, dtype=np.int32)
-    return flat, ptr
-
-
-def build_block_jacobi_solver_from_matrix(
+def assemble_block_jacobi_solver(
     *,
-    J,
     local_blocks: list[LocalProjectionBlock],
+    n_fine: int,
 ) -> Callable[[np.ndarray], np.ndarray]:
-    """Build a fast block-Jacobi solve callable for matrix ``J``."""
-    subdomain, subdomain_ptr = flatten_subdomains_from_local_blocks(local_blocks)
-    _, _, inv_subblock, inv_subblock_ptr = relax.schwarz_parameters(
-        J,
-        subdomain=subdomain,
-        subdomain_ptr=subdomain_ptr,
-        inv_subblock=None,
-        inv_subblock_ptr=None,
-    )
+    """Assemble a block-Jacobi solver from local blocks.
 
-    nblocks = int(subdomain_ptr.shape[0] - 1)
-    blocks: list[tuple[np.ndarray, np.ndarray]] = []
-    for i in range(nblocks):
-        p0 = int(subdomain_ptr[i])
-        p1 = int(subdomain_ptr[i + 1])
-        q0 = int(inv_subblock_ptr[i])
-        q1 = int(inv_subblock_ptr[i + 1])
-        idx = subdomain[p0:p1]
-        m = int(p1 - p0)
-        inv_blk = inv_subblock[q0:q1].reshape((m, m))
-        blocks.append((idx, inv_blk))
+    This factorizes each aggregate-local block ``A_i`` once, then applies
+    ``J^{-1}`` by independent per-block solves:
+
+    ``(J^{-1} rhs)[omega_i] = A_i^{-1} rhs[omega_i]``.
+    """
+    block_systems: list[tuple[np.ndarray, DenseSPDSystem]] = []
+    for block in local_blocks:
+        idx = np.asarray(block.omega_rows, dtype=np.int32).ravel()
+        if idx.size == 0:
+            continue
+        A_i = np.asarray(block.A_i)
+        A_i = 0.5 * (A_i + A_i.T)
+        block_systems.append((idx, factor_dense_spd(A_i)))
 
     def solve_J(rhs: np.ndarray) -> np.ndarray:
-        rhs = np.asarray(rhs).reshape(-1)
-        x = np.zeros_like(rhs)
-        for idx, inv_blk in blocks:
-            x[idx] = inv_blk @ rhs[idx]
+        rr = np.asarray(rhs).reshape(-1)
+        if int(rr.size) != int(n_fine):
+            raise ValueError(f"Expected rhs of length {n_fine}, got {rr.size}")
+        x = np.zeros_like(rr)
+        for idx, sys_i in block_systems:
+            x[idx] = solve_factored_dense_spd(sys_i, rr[idx])
         return x
 
     return solve_J
 
 
-def local_residual(block: LocalProjectionBlock, x_i: np.ndarray) -> np.ndarray:
-    """Apply local coarse residual map ``r_i = (I - Pi_i) x_i``."""
+def apply_local_QJ(block: LocalProjectionBlock, x_i: np.ndarray) -> np.ndarray:
+    """Apply the local block-Jacobi coarse-complement projector ``Q_{J,i}``.
+
+    For one aggregate-local block, this computes
+
+    ``Q_{J,i} x_i = (I - Pi_{J,i}) x_i``
+
+    with
+
+    ``Pi_{J,i} = Z_i (Z_i^T A_i Z_i)^{-1} Z_i^T A_i``.
+    """
     if block.Z_i.shape[1] == 0:
         return x_i
 
@@ -82,28 +70,67 @@ def local_residual(block: LocalProjectionBlock, x_i: np.ndarray) -> np.ndarray:
     return x_i - block.Z_i @ alpha_i
 
 
-def apply_B_block_jacobi(
+def apply_QJ(
+    x: np.ndarray,
+    *,
+    local_blocks: list[LocalProjectionBlock],
+    n_fine: int,
+) -> np.ndarray:
+    """Apply the blockwise global coarse-complement map ``Q_J`` by looping blocks.
+
+    This routine mirrors the per-block loop style used by
+    :func:`apply_WJ_numerator_operator`: it slices each block, applies the local
+    projector complement ``Q_{J,i}``, and writes the result back to the global
+    vector.
+
+    Notes
+    -----
+    The write-back uses direct assignment on each block index set. This is
+    exact when the block index sets are disjoint (the intended block-Jacobi
+    baseline). For overlapping index sets, the assignment semantics may differ
+    from an additive global projector construction.
+    """
+    xx = np.asarray(x).reshape(-1)
+    if int(xx.size) != int(n_fine):
+        raise ValueError(f"Expected x of length {n_fine}, got {xx.size}")
+
+    y = xx.copy()
+    for block in local_blocks:
+        idx = block.omega_rows
+        y[idx] = apply_local_QJ(block, xx[idx])
+    return y
+
+
+def apply_WJ_numerator_operator(
     *,
     x: np.ndarray,
     local_blocks: list[LocalProjectionBlock],
     n_fine: int,
 ) -> tuple[np.ndarray, float]:
-    """Apply block-Jacobi WAP numerator operator ``B`` matrix-free."""
-    y = np.zeros(n_fine, dtype=x.dtype)
-    xBx = 0.0
+    """Apply the block-Jacobi WAP numerator operator.
 
+    For a fine-level vector ``x``, this applies
+
+    ``y = B_J x = A (I - Pi_J) x = A Q_J x``
+
+    using the blockwise projector-complement routine :func:`apply_QJ`, then
+    computes the Rayleigh numerator scalar
+
+    ``x^* B_J x = <Q_J x, A (Q_J x)>``.
+    """
+    xx = np.asarray(x).reshape(-1)
+    if int(xx.size) != int(n_fine):
+        raise ValueError(f"Expected x of length {n_fine}, got {xx.size}")
+
+    qx = apply_QJ(x=xx, local_blocks=local_blocks, n_fine=n_fine)
+    y = np.zeros(n_fine, dtype=xx.dtype)
     for block in local_blocks:
-        x_i = x[block.omega_rows]
-        r_i = local_residual(block, x_i)
+        idx = block.omega_rows
+        y[idx] += block.A_i @ qx[idx]
 
-        y_i = block.A_i @ r_i
-        y[block.omega_rows] += y_i
-
-        c_i = float(np.vdot(r_i, y_i).real)
-        if c_i < 0.0 and abs(c_i) < 1e-12:
-            c_i = 0.0
-        xBx += c_i
-
+    xBx = float(np.vdot(qx, y).real)
+    if xBx < 0.0 and abs(xBx) < 1e-12:
+        xBx = 0.0
     return y, xBx
 
 

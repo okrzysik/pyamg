@@ -6,11 +6,10 @@ from time import perf_counter
 from typing import Callable
 
 import numpy as np
-from scipy.sparse import issparse
 from scipy.sparse.linalg import LinearOperator, lobpcg
 
 from .models import RandomDistribution
-from .reporting import rel_change_history, timer_add
+from .reporting import timer_add
 
 
 def draw_random_vector(
@@ -30,12 +29,11 @@ def draw_random_vector(
     return np.asarray(v, dtype=dtype)
 
 
-def projected_power_perp_MinvOp(
+def _power_metric_inverse_core(
     *,
-    apply_op: Callable[[np.ndarray], np.ndarray],
-    apply_QM: Callable[[np.ndarray], np.ndarray],
-    apply_J: Callable[[np.ndarray], np.ndarray],
-    solve_J: Callable[[np.ndarray], np.ndarray],
+    apply_operator: Callable[[np.ndarray], np.ndarray],
+    apply_metric: Callable[[np.ndarray], np.ndarray],
+    solve_metric: Callable[[np.ndarray], np.ndarray],
     n: int,
     dtype,
     maxiter: int,
@@ -43,29 +41,43 @@ def projected_power_perp_MinvOp(
     miniter: int,
     distribution: RandomDistribution,
     seed: int | None,
+    apply_projector: Callable[[np.ndarray], np.ndarray] | None = None,
+    x0: np.ndarray | None = None,
+    return_vector: bool = False,
     timers: dict[str, float] | None = None,
     timer_prefix: str = "",
-) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Estimate ``N_AJ_perp = lambda_max^\perp(M^{-1}Op)`` on ``ker(P^T M)``."""
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool] | tuple[
+    float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray
+]:
+    """Shared core for metric-inverse power iteration with optional projection."""
     if maxiter <= 0:
-        raise ValueError("Expected maxiter > 0 for projected-perp iteration")
+        raise ValueError("Expected maxiter > 0 for metric-inverse iteration")
     if miniter <= 0:
-        raise ValueError("Expected miniter > 0 for projected-perp iteration")
+        raise ValueError("Expected miniter > 0 for metric-inverse iteration")
     if tol < 0.0:
-        raise ValueError("Expected nonnegative tol for projected-perp iteration")
+        raise ValueError("Expected nonnegative tol for metric-inverse iteration")
 
     rng = np.random.default_rng(seed)
-    r = draw_random_vector(rng=rng, n=n, distribution=distribution, dtype=dtype)
-    r = apply_QM(r)
+    if x0 is None:
+        x = draw_random_vector(rng=rng, n=n, distribution=distribution, dtype=dtype)
+    else:
+        x = np.asarray(x0, dtype=dtype).reshape(-1)
+        if int(x.size) != int(n):
+            raise ValueError(f"Warm-start x0 has incompatible size {x.size} != {n}")
+
+    if apply_projector is not None:
+        x = apply_projector(x)
 
     for _ in range(5):
-        den0 = float(np.vdot(r, apply_J(r)).real)
+        den0 = float(np.vdot(x, apply_metric(x)).real)
         if den0 > 0.0:
-            r /= np.sqrt(den0)
+            x /= np.sqrt(den0)
             break
-        r = apply_QM(draw_random_vector(rng=rng, n=n, distribution=distribution, dtype=dtype))
+        x = draw_random_vector(rng=rng, n=n, distribution=distribution, dtype=dtype)
+        if apply_projector is not None:
+            x = apply_projector(x)
     else:
-        raise ValueError("Failed to initialize nonzero vector in ker(P^T M)")
+        raise ValueError("Failed to initialize nonzero vector in metric norm")
 
     lam_hist: list[float] = []
     rel_hist: list[float] = []
@@ -77,129 +89,27 @@ def projected_power_perp_MinvOp(
     for _k in range(maxiter):
         timer_add(timers, f"{timer_prefix}n_iter", 1.0)
 
-        t_apply_op = perf_counter()
-        y = apply_op(r)
-        timer_add(timers, f"{timer_prefix}apply_op_sec", perf_counter() - t_apply_op)
+        t_apply_operator = perf_counter()
+        y = apply_operator(x)
+        timer_add(timers, f"{timer_prefix}apply_operator_sec", perf_counter() - t_apply_operator)
 
-        jx = apply_J(r)
-        den = float(np.vdot(r, jx).real)
+        mx = apply_metric(x)
+        den = float(np.vdot(x, mx).real)
         if den <= 0.0:
-            raise ValueError("Encountered non-positive J-norm in projected-perp N_AJ iteration")
-        lam = float(np.vdot(r, y).real / den)
-        if lam < 0.0 and abs(lam) < 1e-12:
-            lam = 0.0
-        lam_hist.append(lam)
-
-        gres = np.asarray(y - lam * jx).reshape(-1)
-        t_res = perf_counter()
-        gres = apply_QM(gres)
-        timer_add(timers, f"{timer_prefix}apply_QM_res_sec", perf_counter() - t_res)
-        t_res_solve = perf_counter()
-        zres = solve_J(gres)
-        timer_add(timers, f"{timer_prefix}solve_J_res_sec", perf_counter() - t_res_solve)
-        m_inv_norm_sq = float(np.vdot(gres, zres).real)
-        if m_inv_norm_sq < 0.0 and abs(m_inv_norm_sq) < 1e-12:
-            m_inv_norm_sq = 0.0
-        abs_res = float(np.sqrt(max(m_inv_norm_sq, 0.0)))
-        rel_res = float(abs_res / max(abs(lam) * np.sqrt(max(den, 0.0)), 1e-300))
-        abs_res_hist.append(abs_res)
-        rel_res_hist.append(rel_res)
-
-        if prev is None:
-            rel = np.inf
-        else:
-            rel = abs(lam - prev) / max(abs(prev), 1.0)
-        rel_hist.append(float(rel))
-        prev = lam
-
-        if len(lam_hist) >= miniter and rel <= tol:
-            converged = True
-            break
-
-        t_solve_J = perf_counter()
-        z = solve_J(y)
-        timer_add(timers, f"{timer_prefix}solve_J_sec", perf_counter() - t_solve_J)
-
-        t_apply_qm = perf_counter()
-        z = apply_QM(z)
-        timer_add(timers, f"{timer_prefix}apply_QM_sec", perf_counter() - t_apply_qm)
-
-        t_apply_j = perf_counter()
-        den = float(np.vdot(z, apply_J(z)).real)
-        timer_add(timers, f"{timer_prefix}apply_J_sec", perf_counter() - t_apply_j)
-        if den <= 0.0:
-            converged = True
-            break
-        r = z / np.sqrt(den)
-
-    arr = np.asarray(lam_hist, dtype=float)
-    rel_arr = np.asarray(rel_hist, dtype=float)
-    abs_res_arr = np.asarray(abs_res_hist, dtype=float)
-    rel_res_arr = np.asarray(rel_res_hist, dtype=float)
-    if arr.size == 0:
-        raise ValueError("No iterations executed in projected-perp iteration")
-    return float(arr[-1]), arr, rel_arr, abs_res_arr, rel_res_arr, bool(converged)
-
-
-def power_MinvOp(
-    *,
-    apply_op: Callable[[np.ndarray], np.ndarray],
-    apply_J: Callable[[np.ndarray], np.ndarray],
-    solve_J: Callable[[np.ndarray], np.ndarray],
-    n: int,
-    dtype,
-    maxiter: int,
-    tol: float,
-    miniter: int,
-    distribution: RandomDistribution,
-    seed: int | None,
-    timers: dict[str, float] | None = None,
-    timer_prefix: str = "",
-) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Estimate ``N_AJ = lambda_max(M^{-1}Op)`` by power iteration."""
-    if maxiter <= 0:
-        raise ValueError("Expected maxiter > 0 for N_AJ iteration")
-    if miniter <= 0:
-        raise ValueError("Expected miniter > 0 for N_AJ iteration")
-    if tol < 0.0:
-        raise ValueError("Expected nonnegative tol for N_AJ iteration")
-
-    rng = np.random.default_rng(seed)
-    x = draw_random_vector(rng=rng, n=n, distribution=distribution, dtype=dtype)
-    den0 = float(np.vdot(x, apply_J(x)).real)
-    if den0 <= 0.0:
-        den0 = float(np.vdot(x, x).real)
-        if den0 <= 0.0:
-            raise ValueError("Failed to initialize nonzero vector for N_AJ iteration")
-    x /= np.sqrt(den0)
-
-    lam_hist: list[float] = []
-    rel_hist: list[float] = []
-    abs_res_hist: list[float] = []
-    rel_res_hist: list[float] = []
-    converged = False
-    prev = None
-
-    for _k in range(maxiter):
-        timer_add(timers, f"{timer_prefix}n_iter", 1.0)
-
-        t_apply_op = perf_counter()
-        y = apply_op(x)
-        timer_add(timers, f"{timer_prefix}apply_op_sec", perf_counter() - t_apply_op)
-
-        jx = apply_J(x)
-        den = float(np.vdot(x, jx).real)
-        if den <= 0.0:
-            raise ValueError("Encountered non-positive M-norm in N_AJ iteration")
+            raise ValueError("Encountered non-positive metric norm in iteration")
         lam = float(np.vdot(x, y).real / den)
         if lam < 0.0 and abs(lam) < 1e-12:
             lam = 0.0
         lam_hist.append(lam)
 
-        res = np.asarray(y - lam * jx).reshape(-1)
-        t_res_solve = perf_counter()
-        zres = solve_J(res)
-        timer_add(timers, f"{timer_prefix}solve_J_res_sec", perf_counter() - t_res_solve)
+        res = np.asarray(y - lam * mx).reshape(-1)
+        if apply_projector is not None:
+            t_proj_res = perf_counter()
+            res = apply_projector(res)
+            timer_add(timers, f"{timer_prefix}apply_projector_res_sec", perf_counter() - t_proj_res)
+        t_res_solve_metric = perf_counter()
+        zres = solve_metric(res)
+        timer_add(timers, f"{timer_prefix}solve_metric_res_sec", perf_counter() - t_res_solve_metric)
         m_inv_norm_sq = float(np.vdot(res, zres).real)
         if m_inv_norm_sq < 0.0 and abs(m_inv_norm_sq) < 1e-12:
             m_inv_norm_sq = 0.0
@@ -219,13 +129,18 @@ def power_MinvOp(
             converged = True
             break
 
-        t_solve_J = perf_counter()
-        z = solve_J(y)
-        timer_add(timers, f"{timer_prefix}solve_J_sec", perf_counter() - t_solve_J)
+        t_solve_metric = perf_counter()
+        z = solve_metric(y)
+        timer_add(timers, f"{timer_prefix}solve_metric_sec", perf_counter() - t_solve_metric)
 
-        t_apply_j = perf_counter()
-        denz = float(np.vdot(z, apply_J(z)).real)
-        timer_add(timers, f"{timer_prefix}apply_J_sec", perf_counter() - t_apply_j)
+        if apply_projector is not None:
+            t_proj = perf_counter()
+            z = apply_projector(z)
+            timer_add(timers, f"{timer_prefix}apply_projector_sec", perf_counter() - t_proj)
+
+        t_apply_metric = perf_counter()
+        denz = float(np.vdot(z, apply_metric(z)).real)
+        timer_add(timers, f"{timer_prefix}apply_metric_sec", perf_counter() - t_apply_metric)
         if denz <= 0.0:
             converged = True
             break
@@ -236,27 +151,147 @@ def power_MinvOp(
     abs_res_arr = np.asarray(abs_res_hist, dtype=float)
     rel_res_arr = np.asarray(rel_res_hist, dtype=float)
     if arr.size == 0:
-        raise ValueError("No iterations executed in N_AJ iteration")
+        raise ValueError("No iterations executed in metric-inverse iteration")
+    x_out = np.asarray(x, dtype=dtype).reshape(-1)
+    if return_vector:
+        return float(arr[-1]), arr, rel_arr, abs_res_arr, rel_res_arr, bool(converged), x_out
     return float(arr[-1]), arr, rel_arr, abs_res_arr, rel_res_arr, bool(converged)
 
 
-def lobpcg_MinvOp(
+def power_metric_inverse_operator(
     *,
-    A,
-    J,
-    solve_J: Callable[[np.ndarray], np.ndarray],
+    apply_operator: Callable[[np.ndarray], np.ndarray],
+    apply_metric: Callable[[np.ndarray], np.ndarray],
+    solve_metric: Callable[[np.ndarray], np.ndarray],
+    n: int,
+    dtype,
+    maxiter: int,
+    tol: float,
+    miniter: int,
+    distribution: RandomDistribution,
+    seed: int | None,
+    timers: dict[str, float] | None = None,
+    timer_prefix: str = "",
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
+    """Estimate ``lambda_max(metric^{-1} operator)`` by power iteration.
+
+    Parameters
+    ----------
+    apply_operator
+        Callable returning ``operator @ x``.
+    apply_metric
+        Callable returning ``metric @ x`` for the SPD metric used in Rayleigh
+        quotients and normalization.
+    solve_metric
+        Callable approximately/exactly solving ``metric z = rhs``.
+    n, dtype
+        Vector dimension and working dtype.
+    maxiter, tol, miniter
+        Iteration controls; stopping is based on relative eigenvalue change.
+    distribution, seed
+        Random initialization settings.
+    """
+    return _power_metric_inverse_core(
+        apply_operator=apply_operator,
+        apply_metric=apply_metric,
+        solve_metric=solve_metric,
+        n=n,
+        dtype=dtype,
+        maxiter=maxiter,
+        tol=tol,
+        miniter=miniter,
+        distribution=distribution,
+        seed=seed,
+        apply_projector=None,
+        x0=None,
+        return_vector=False,
+        timers=timers,
+        timer_prefix=timer_prefix,
+    )
+
+
+def power_metric_inverse_operator_projected(
+    *,
+    apply_operator: Callable[[np.ndarray], np.ndarray],
+    apply_projector: Callable[[np.ndarray], np.ndarray],
+    apply_metric: Callable[[np.ndarray], np.ndarray],
+    solve_metric: Callable[[np.ndarray], np.ndarray],
+    n: int,
+    dtype,
+    maxiter: int,
+    tol: float,
+    miniter: int,
+    distribution: RandomDistribution,
+    seed: int | None,
+    x0: np.ndarray | None = None,
+    return_vector: bool = False,
+    timers: dict[str, float] | None = None,
+    timer_prefix: str = "",
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool] | tuple[
+    float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray
+]:
+    """Estimate the dominant projected eigenvalue of ``metric^{-1} operator``.
+
+    This computes the largest eigenvalue of the projected iteration
+    ``P metric^{-1} operator P``, where ``P`` is represented by
+    ``apply_projector``.
+
+    Non-trivial inputs
+    ------------------
+    apply_projector
+        Projection/filter map applied to vectors, residuals, and iterates. In
+        this codebase it is typically ``Q_J``.
+    apply_metric / solve_metric
+        Metric action and metric solve defining the generalized eigenproblem.
+    x0
+        Optional warm start. If provided, it is projected and metric-normalized
+        internally before iterations.
+    return_vector
+        When ``True``, also return the final normalized iterate.
+    """
+    return _power_metric_inverse_core(
+        apply_operator=apply_operator,
+        apply_metric=apply_metric,
+        solve_metric=solve_metric,
+        n=n,
+        dtype=dtype,
+        maxiter=maxiter,
+        tol=tol,
+        miniter=miniter,
+        distribution=distribution,
+        seed=seed,
+        apply_projector=apply_projector,
+        x0=x0,
+        return_vector=return_vector,
+        timers=timers,
+        timer_prefix=timer_prefix,
+    )
+
+
+def lobpcg_metric_inverse_operator(
+    *,
+    operator_matrix,
+    metric_matrix,
+    solve_metric: Callable[[np.ndarray], np.ndarray],
     n: int,
     block_size: int,
     maxiter: int,
     tol: float,
     distribution: RandomDistribution,
     seed: int | None,
-    Y=None,
-    apply_QM_for_residual: Callable[[np.ndarray], np.ndarray] | None = None,
+    return_vector: bool = False,
     timers: dict[str, float] | None = None,
     timer_prefix: str = "",
-) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Estimate top generalized eigenvalue of ``A x = lambda J x`` using LOBPCG."""
+) -> tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool] | tuple[
+    float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray
+]:
+    """Estimate top generalized eigenvalue of ``operator x = lambda metric x`` using LOBPCG.
+
+    Notes
+    -----
+    This wrapper returns final residual diagnostics only. It intentionally does
+    not request or process per-iteration LOBPCG histories.
+    """
     if block_size <= 0:
         raise ValueError("Expected positive block_size for LOBPCG")
     if maxiter <= 0:
@@ -269,44 +304,26 @@ def lobpcg_MinvOp(
     if distribution == "rademacher":
         X = np.sign(X)
         X[X == 0.0] = 1.0
-    X = np.asarray(X, dtype=A.dtype)
-
-    Y_lobpcg = None
-    if Y is not None:
-        if issparse(Y):
-            raise ValueError(
-                "SciPy lobpcg constraints require a dense Y array. "
-                "Refusing to densify sparse P; use a projected method instead."
-            )
-        Y_lobpcg = np.asarray(Y, dtype=A.dtype)
-        if Y_lobpcg.ndim == 1:
-            Y_lobpcg = Y_lobpcg.reshape(-1, 1)
-        if Y_lobpcg.shape[0] != n:
-            raise ValueError(
-                f"Constraint matrix Y has incompatible row count {Y_lobpcg.shape[0]} != {n}"
-            )
+    X = np.asarray(X, dtype=operator_matrix.dtype)
 
     def m_solve(v):
         arr = np.asarray(v)
         if arr.ndim == 1:
-            return solve_J(arr)
-        out = np.column_stack([solve_J(arr[:, j]) for j in range(arr.shape[1])])
+            return solve_metric(arr)
+        out = np.column_stack([solve_metric(arr[:, j]) for j in range(arr.shape[1])])
         return out
 
-    M_prec = LinearOperator(shape=A.shape, matvec=lambda v: m_solve(v), dtype=A.dtype)
+    M_prec = LinearOperator(shape=operator_matrix.shape, matvec=lambda v: m_solve(v), dtype=operator_matrix.dtype)
 
     t_lobpcg = perf_counter()
-    vals, vecs, lam_hist_raw, _res_hist_raw = lobpcg(
-        A,
+    vals, vecs = lobpcg(
+        operator_matrix,
         X,
-        B=J,
+        B=metric_matrix,
         M=M_prec,
-        Y=Y_lobpcg,
         tol=tol,
         maxiter=maxiter,
         largest=True,
-        retLambdaHistory=True,
-        retResidualNormsHistory=True,
     )
     timer_add(timers, f"{timer_prefix}solve_lobpcg_sec", perf_counter() - t_lobpcg)
 
@@ -315,41 +332,39 @@ def lobpcg_MinvOp(
     lam = float(vals[j])
     u = np.asarray(vecs[:, j]).reshape(-1)
 
-    hist_vals: list[float] = []
-    for h in lam_hist_raw:
-        hh = np.asarray(h, dtype=float).reshape(-1)
-        if hh.size:
-            hist_vals.append(float(np.max(hh)))
-    if not hist_vals:
-        hist_vals = [lam]
-    hist = np.asarray(hist_vals, dtype=float)
-    rel_hist = rel_change_history(hist)
-
-    ju = np.asarray(J @ u).reshape(-1)
-    r = np.asarray(A @ u - lam * ju).reshape(-1)
-    if apply_QM_for_residual is not None:
-        r = apply_QM_for_residual(r)
-    zres = solve_J(r)
+    mu = np.asarray(metric_matrix @ u).reshape(-1)
+    r = np.asarray(operator_matrix @ u - lam * mu).reshape(-1)
+    zres = solve_metric(r)
     m_inv_norm_sq = float(np.vdot(r, zres).real)
     if m_inv_norm_sq < 0.0 and abs(m_inv_norm_sq) < 1e-12:
         m_inv_norm_sq = 0.0
     abs_res = float(np.sqrt(max(m_inv_norm_sq, 0.0)))
-    den = float(np.vdot(u, ju).real)
+    den = float(np.vdot(u, mu).real)
     rel_res = float(abs_res / max(abs(lam) * np.sqrt(max(den, 0.0)), 1e-300))
 
-    abs_res_hist = np.full(hist.shape, abs_res, dtype=float)
-    rel_res_hist = np.full(hist.shape, rel_res, dtype=float)
-    converged = bool(hist.size >= 2 and np.isfinite(rel_hist[-1]) and rel_hist[-1] <= tol)
-    if timers is not None:
-        timers[f"{timer_prefix}n_iter"] = float(hist.size)
+    hist = np.asarray([], dtype=float)
+    rel_hist = np.asarray([], dtype=float)
+    abs_res_hist = np.asarray([abs_res], dtype=float)
+    rel_res_hist = np.asarray([rel_res], dtype=float)
+    converged = bool(np.isfinite(rel_res) and rel_res <= tol)
+    if return_vector:
+        return (
+            lam,
+            hist,
+            rel_hist,
+            abs_res_hist,
+            rel_res_hist,
+            converged,
+            np.asarray(u, dtype=operator_matrix.dtype),
+        )
     return lam, hist, rel_hist, abs_res_hist, rel_res_hist, converged
 
 
-def power_iteration_AinvB(
+def power_generalized_eigen_matrix_free(
     *,
-    A,
-    apply_B: Callable[[np.ndarray], tuple[np.ndarray, float]],
-    solve_A: Callable[[np.ndarray], np.ndarray],
+    metric_matrix,
+    apply_numerator: Callable[[np.ndarray], tuple[np.ndarray, float]],
+    solve_metric: Callable[[np.ndarray], np.ndarray],
     x0: np.ndarray,
     maxiter: int,
     tol: float,
@@ -357,12 +372,17 @@ def power_iteration_AinvB(
     timers: dict[str, float] | None = None,
     timer_prefix: str = "",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
-    """Run power iteration on ``T = A^{-1}B`` using matrix-free B applications."""
+    """Estimate dominant ``lambda`` in ``numerator x = lambda metric x``.
+
+    The numerator action is matrix-free via ``apply_numerator(x)``, which
+    returns both ``numerator @ x`` and the Rayleigh numerator scalar
+    ``x^* numerator x``.
+    """
     x = np.asarray(x0).reshape(-1).copy()
-    x_A_norm_sq = float(np.vdot(x, A @ x).real)
-    if x_A_norm_sq <= 0.0:
-        raise ValueError(f"Initial vector has non-positive A-norm squared: {x_A_norm_sq}")
-    x /= np.sqrt(x_A_norm_sq)
+    x_metric_norm_sq = float(np.vdot(x, metric_matrix @ x).real)
+    if x_metric_norm_sq <= 0.0:
+        raise ValueError(f"Initial vector has non-positive metric-norm squared: {x_metric_norm_sq}")
+    x /= np.sqrt(x_metric_norm_sq)
 
     lambda_hist: list[float] = []
     rel_hist: list[float] = []
@@ -374,10 +394,10 @@ def power_iteration_AinvB(
     for _k in range(maxiter):
         timer_add(timers, f"{timer_prefix}n_iter", 1.0)
 
-        t_apply_b = perf_counter()
-        y, num = apply_B(x)
-        timer_add(timers, f"{timer_prefix}apply_B_sec", perf_counter() - t_apply_b)
-        den = float(np.vdot(x, A @ x).real)
+        t_apply_numerator = perf_counter()
+        y, num = apply_numerator(x)
+        timer_add(timers, f"{timer_prefix}apply_numerator_sec", perf_counter() - t_apply_numerator)
+        den = float(np.vdot(x, metric_matrix @ x).real)
         if den <= 0.0:
             raise ValueError(f"Encountered non-positive denominator in Rayleigh quotient: {den}")
         lam = float(num / den)
@@ -402,13 +422,13 @@ def power_iteration_AinvB(
             converged = True
             break
 
-        t_solve_a = perf_counter()
-        z = solve_A(y)
-        timer_add(timers, f"{timer_prefix}solve_A_sec", perf_counter() - t_solve_a)
-        z_A_norm_sq = float(np.vdot(z, A @ z).real)
-        if z_A_norm_sq <= 0.0:
-            raise ValueError(f"Encountered non-positive A-norm squared during iteration: {z_A_norm_sq}")
-        x = z / np.sqrt(z_A_norm_sq)
+        t_solve_metric = perf_counter()
+        z = solve_metric(y)
+        timer_add(timers, f"{timer_prefix}solve_metric_sec", perf_counter() - t_solve_metric)
+        z_metric_norm_sq = float(np.vdot(z, metric_matrix @ z).real)
+        if z_metric_norm_sq <= 0.0:
+            raise ValueError(f"Encountered non-positive metric-norm squared during iteration: {z_metric_norm_sq}")
+        x = z / np.sqrt(z_metric_norm_sq)
 
     return (
         np.asarray(lambda_hist, dtype=float),

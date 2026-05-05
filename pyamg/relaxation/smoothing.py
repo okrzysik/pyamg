@@ -657,7 +657,7 @@ def setup_additive_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
 
 def setup_rest_additive_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
                                 subdomain_ptr=None, POU=None, inv_subblock=None,
-                                inv_subblock_ptr=None):
+                                inv_subblock_ptr=None, omega=1.0):
     """Set up Restricted Additive Schwarz."""
     matrix_asformat(lvl, 'A', 'csr')
     lvl.Acsr.sort_indices()
@@ -675,13 +675,14 @@ def setup_rest_additive_schwarz(lvl, iterations=DEFAULT_NITER, subdomain=None,
                                     subdomain_ptr=subdomain_ptr,
                                     POU=POU,
                                     inv_subblock=inv_subblock,
-                                    inv_subblock_ptr=inv_subblock_ptr)
+                                    inv_subblock_ptr=inv_subblock_ptr,
+                                    omega=omega)
     update_wrapper(smoother, relaxation.rest_additive_schwarz)  # set __name__
     return smoother
 
 def setup_rest_additive_schwarzT(lvl, iterations=DEFAULT_NITER, subdomain=None,
                                 subdomain_ptr=None, POU=None, inv_subblock=None,
-                                inv_subblock_ptr=None):
+                                inv_subblock_ptr=None, omega=1.0):
     """Set up Adjoint Restricted Additive Schwarz."""
     matrix_asformat(lvl, 'A', 'csr')
     lvl.Acsr.sort_indices()
@@ -699,7 +700,8 @@ def setup_rest_additive_schwarzT(lvl, iterations=DEFAULT_NITER, subdomain=None,
                                     subdomain_ptr=subdomain_ptr,
                                     POU=POU,
                                     inv_subblock=inv_subblock,
-                                    inv_subblock_ptr=inv_subblock_ptr)
+                                    inv_subblock_ptr=inv_subblock_ptr,
+                                    omega=omega)
     update_wrapper(smoother, relaxation.rest_additive_schwarzT)  # set __name__
     return smoother
 

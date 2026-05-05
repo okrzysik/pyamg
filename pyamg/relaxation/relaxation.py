@@ -353,7 +353,7 @@ def additive_schwarz(A, x, b, iterations=1, subdomain=None, subdomain_ptr=None,
 
 
 def rest_additive_schwarz(A, x, b, iterations=1, subdomain=None, subdomain_ptr=None,
-                          POU=None, inv_subblock=None, inv_subblock_ptr=None):
+                          POU=None, inv_subblock=None, inv_subblock_ptr=None, omega=1.0):
     """Perform Overlapping additive Schwarz on the linear system Ax=b.
 
     Parameters
@@ -406,23 +406,27 @@ def rest_additive_schwarz(A, x, b, iterations=1, subdomain=None, subdomain_ptr=N
 
     if subdomain is None or subdomain_ptr is None or POU is None:
         raise ValueError('Subdomains and POU must be provided for RAS')
+    if not np.isscalar(omega):
+        raise ValueError('omega must be scalar')
 
     (subdomain, subdomain_ptr, inv_subblock, inv_subblock_ptr) = \
         schwarz_parameters(A, subdomain, subdomain_ptr,
                            inv_subblock, inv_subblock_ptr)
 
     row_start, row_stop, row_step = 0, subdomain_ptr.shape[0]-1, 1
+    [omega] = type_prep(A.dtype, [omega])
 
     # Call C code, need to make sure that subdomains are sorted and unique
     for _iter in range(iterations):
-        r = b - A@x     # Compute residual       
+        #r = b - A@x     # Compute residual       
+        r = omega * (b - A@x)     # Compute damped residual
         amg_core.overlapping_ras(x, r, inv_subblock, inv_subblock_ptr,
                                  subdomain, subdomain_ptr, POU,
                                  subdomain_ptr.shape[0]-1,
                                  row_start, row_stop, row_step)
 
 def rest_additive_schwarzT(A, x, b, iterations=1, subdomain=None, subdomain_ptr=None,
-                          POU=None, inv_subblock=None, inv_subblock_ptr=None):
+                          POU=None, inv_subblock=None, inv_subblock_ptr=None, omega=1.0):
     """Perform adjoint of Overlapping additive Schwarz on the linear system Ax=b.
 
     Parameters
@@ -481,10 +485,12 @@ def rest_additive_schwarzT(A, x, b, iterations=1, subdomain=None, subdomain_ptr=
                            inv_subblock, inv_subblock_ptr)
 
     row_start, row_stop, row_step = 0, subdomain_ptr.shape[0]-1, 1
+    [omega] = type_prep(A.dtype, [omega])
 
     # Call C code, need to make sure that subdomains are sorted and unique
     for _iter in range(iterations):
-        r = b - A@x     # Compute residual       
+        #r = b - A@x     # Compute residual       
+        r = omega * (b - A@x)     # Compute damped residual
         amg_core.overlapping_rasT(x, r, inv_subblock, inv_subblock_ptr,
                                  subdomain, subdomain_ptr, POU,
                                  subdomain_ptr.shape[0]-1,

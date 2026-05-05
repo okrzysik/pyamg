@@ -30,7 +30,8 @@ from .lsdd.smoothers import lsdd_make_smoother_spec
 from .lsdd.types import FilteringSpec, SparseLike
 
 Symmetry = Literal["symmetric", "hermitian"]
-SmootherName = Literal["msm", "asm", "ras", "rasT"] | None
+SmootherName = Literal["msm", "asm", "ras", "rasT"]
+SmootherArg = SmootherName | tuple[SmootherName, dict[str, Any]] | None
 
 
 
@@ -39,8 +40,8 @@ def least_squares_dd_solver_exp(
     BT: SparseLike | None = None,
     A: SparseLike | None = None,
     *,
-    presmoother: SmootherName = "ras",
-    postsmoother: SmootherName = "rasT",
+    presmoother: SmootherArg = "ras",
+    postsmoother: SmootherArg = "rasT",
     symmetry: Symmetry = "symmetric",
     strength: Any = None,
     aggregate: Any = "standard",
@@ -48,6 +49,7 @@ def least_squares_dd_solver_exp(
     kappa: float | list[float] = 500,
     nev: int | None = None,
     threshold: float | None = None,
+    mult_threshold: float | list[float | None] | None = None,
     min_coarsening: int | list[int] | None = None,
     max_levels: int = 10,
     max_coarse: int = 100,
@@ -83,6 +85,8 @@ def least_squares_dd_solver_exp(
         Optional normal-equations matrix (n x n). If None, formed as BT @ B.
     presmoother, postsmoother
         Schwarz-based smoothers on each level. Typical choice: ("ras", "rasT").
+        May also be provided as ``(name, kwargs)`` tuples, e.g.
+        ``("asm", {"omega": 0.8, "withrho": True, "domain": "omega"})``.
     symmetry
         "symmetric" or "hermitian". Stored as metadata on A.
     strength, aggregate
@@ -95,6 +99,12 @@ def least_squares_dd_solver_exp(
     nev, threshold
         Eigenvector selection knobs for the local GEPs: keep either a fixed
         number (nev) or those above a threshold (threshold).
+    mult_threshold
+        Optional multiplicity-scaled threshold for local GEP selection when
+        ``nev`` is None. For aggregate ``i``, keep vectors with
+        ``ev > mult_threshold * max(v_row_mult[R_rows_i])``.
+        Can be scalar (applied on all levels) or a per-level list.
+        Mutually exclusive with ``threshold``.
     min_coarsening
         Enforce a minimum coarsening ratio (levelized internally).
     max_levels, max_coarse, max_density
@@ -173,6 +183,17 @@ def least_squares_dd_solver_exp(
     
     if symmetry not in ('symmetric', 'hermitian'):
         raise ValueError('Expected "symmetric" or "hermitian" for the symmetry parameter ')
+
+    if threshold is not None and mult_threshold is not None:
+        raise ValueError('threshold and mult_threshold are mutually exclusive; set at most one')
+
+    if isinstance(mult_threshold, list):
+        for mt in mult_threshold:
+            if mt is not None and mt < 0:
+                raise ValueError('Expected nonnegative entries in mult_threshold when provided')
+    elif mult_threshold is not None and mult_threshold < 0:
+        raise ValueError('Expected nonnegative mult_threshold when provided')
+
     A.symmetry = symmetry
     
     # Set "schwarz_use_cholesky" flag to trigger Cholesky-based inversion of Schwarz blocks in the presmoother. The matrix here A here must be SPD.
@@ -188,6 +209,7 @@ def least_squares_dd_solver_exp(
     max_levels, max_coarse, aggregate =\
         levelize_strength_or_aggregation(aggregate, max_levels, max_coarse)
     kappa =  levelize_weight(kappa,max_levels)
+    mult_threshold = levelize_weight(mult_threshold,max_levels)
     min_coarsening = levelize_weight(min_coarsening,max_levels)
 
     # Ensure filtering specs are in the form (bool, float)
@@ -223,6 +245,7 @@ def least_squares_dd_solver_exp(
             kappa=float(kappa[lvl]),
             nev=nev,
             threshold=threshold,
+            mult_threshold=mult_threshold[lvl],
             min_coarsening=min_coarsening[lvl],
             filteringA=filteringA,
             filteringB=filteringB,

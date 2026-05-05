@@ -169,7 +169,8 @@ def prepare_local_projection_blocks(level) -> tuple[list[LocalProjectionBlock], 
         if c1 > c0:
             Z_i = P[omega_rows, c0:c1].toarray()
             AZ_i = A_i @ Z_i
-            G_i = 0.5 * (Z_i.T @ AZ_i + (Z_i.T @ AZ_i).T)
+            G_i = Z_i.T @ AZ_i
+            G_i = 0.5 * (G_i + G_i.T)
             fact = factor_dense_spd(G_i)
             blk = LocalProjectionBlock(
                 agg_id=i,

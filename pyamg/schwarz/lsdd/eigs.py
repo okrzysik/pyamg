@@ -43,6 +43,7 @@ def _lsdd_process_one_aggregate_gep(
     level: LSDDLevel,
     robust_Sker_handling: bool,
     nev: int | None,
+    mult_threshold: float | None,
     min_coarsening: int | None,
     counter: int,
     p_r: list,
@@ -82,8 +83,13 @@ def _lsdd_process_one_aggregate_gep(
         If not None: keep exactly the largest `nev` eigenpairs, additionally capped by
         `min_coarsening` if provided.
 
-        If None: keep all eigenpairs with eigenvalue > `threshold`, scanning from
-        largest to smaller eigenvalues.
+        If None: keep all eigenpairs with eigenvalue > threshold, scanning from
+        largest to smaller eigenvalues, where threshold is either:
+          - `mult_threshold * max(v_row_mult[R_rows_i])` if `mult_threshold` is set, or
+          - `level.eigs.threshold` otherwise.
+
+    mult_threshold
+        Optional multiplicity-scaled threshold coefficient used when `nev is None`.
 
     min_coarsening
         If not None, cap the number of kept eigenpairs by
@@ -132,6 +138,15 @@ def _lsdd_process_one_aggregate_gep(
         return counter
 
     blocks = level.blocks
+    nloc_total: int | None = None
+
+    # Robust-path caches for boundary-eigenvalue queries (first discarded mode).
+    robust_z_total: int | None = None
+    robust_n2: int | None = None
+    robust_Efin_sel: np.ndarray | None = None
+    robust_Q2: np.ndarray | None = None
+    robust_d2: np.ndarray | None = None
+    robust_Ahat_cache: np.ndarray | None = None
 
     # ---- unpack flattened local dense blocks ----
     p0 = blocks.submatrices_ptr[i]
@@ -146,6 +161,22 @@ def _lsdd_process_one_aggregate_gep(
     aa_full = a_flat.reshape((a_dim, a_dim))
     bb_full = b_flat.reshape((b_dim, b_dim))
     _tadd("gep_unpack", perf_counter() - t0)
+
+    t0 = perf_counter()
+    if mult_threshold is None:
+        thr = float(level.eigs.threshold)
+    else:
+        R_rows_i = level.sub.R_rows[i]
+        if R_rows_i is None:
+            raise ValueError("Expected level.sub.R_rows to be populated before GEP solve")
+        M_i = np.asarray(level.v_row_mult[np.asarray(R_rows_i, dtype=np.int32)], dtype=float)
+        max_mult_i = float(np.max(M_i)) if M_i.size else 0.0
+        thr = float(mult_threshold) * max_mult_i
+        thr = max(thr, 1.1)
+
+        print(f"Aggregate {i}: thr = {thr}, max_mult = {max_mult_i}")
+
+    _tadd("gep_threshold", perf_counter() - t0)
 
     
     #  -------------------------------------------------------------------------
@@ -205,6 +236,7 @@ def _lsdd_process_one_aggregate_gep(
         #   - subset_by_index: keep only the largest k eigenpairs (best when k is known/capped)
         #   - subset_by_value: keep only eigenpairs with lambda >= thr (best in threshold mode)
         nloc = S.shape[0]
+        nloc_total = int(nloc)
         subset_kwargs: dict[str, object] = {}
 
         # If nev is set, we will keep at most `nev` eigenvectors (also capped by max_keep).
@@ -266,10 +298,8 @@ def _lsdd_process_one_aggregate_gep(
         if aa.shape[0] == 0:
             return counter
 
+        nloc_total = int(aa.shape[0])
         max_keep = min(max_keep, aa.shape[0])
-
-        # Need threshold early (existing code uses it later)
-        thr = float(level.eigs.threshold)
 
         _tadd("gep_cap_and_restrict", perf_counter() - t0)
 
@@ -326,6 +356,10 @@ def _lsdd_process_one_aggregate_gep(
         Z = Q[:, mask0]          # near-kernel basis (omega-dofs)
         Q2 = Q[:, ~mask0]        # orthogonal complement
         d2 = sS[~mask0]          # strictly positive eigenvalues on complement
+        robust_z_total = int(Z.shape[1])
+        robust_n2 = int(Q2.shape[1])
+        robust_Q2 = Q2
+        robust_d2 = d2
 
         # Z vectors count toward max_keep (and toward nev, if nev is fixed).
         zkeep = min(Z.shape[1], max_keep)
@@ -381,6 +415,8 @@ def _lsdd_process_one_aggregate_gep(
                 #   v = Q2 x
                 X_fin = inv_sqrt_d2[:, None] * Y
                 V_fin = Q2 @ X_fin
+                robust_Efin_sel = np.asarray(E_fin, dtype=float)
+                robust_Ahat_cache = Ahat
 
                 E_parts.append(np.asarray(E_fin, dtype=float))
                 V_parts.append(V_fin)
@@ -419,9 +455,63 @@ def _lsdd_process_one_aggregate_gep(
     local_positions = np.arange(idx0, idx1, dtype=np.int32)[omega]
     global_rows = blocks.subdomain[local_positions]
 
-    # Access threshold + per-aggregate nev array
-    thr = float(level.eigs.threshold)
+    # Access per-aggregate threshold + row map
     _tadd("gep_map_rows", perf_counter() - t0)
+
+    def _query_nonrobust_generalized_eig_by_asc_index(idx: int) -> float:
+        """Return lambda_idx for generalized (aa,S), where idx is ascending-order index."""
+        try:
+            ev = eigh(aa, S, subset_by_index=[idx, idx], eigvals_only=True)
+            return float(np.asarray(ev).reshape(-1)[0])
+        except TypeError:
+            ev_all = eigh(aa, S, eigvals_only=True)
+            return float(np.asarray(ev_all).reshape(-1)[idx])
+
+    def _query_robust_finite_eig_by_asc_index(idx: int) -> float:
+        """Return finite generalized eigenvalue by ascending index within finite spectrum."""
+        nonlocal robust_Ahat_cache
+        if robust_n2 is None or robust_Q2 is None or robust_d2 is None:
+            raise ValueError("Robust finite-spectrum data is unavailable for boundary query")
+
+        if robust_Efin_sel is not None:
+            lo = robust_n2 - int(robust_Efin_sel.size)
+            if idx >= lo:
+                return float(robust_Efin_sel[idx - lo])
+
+        if robust_Ahat_cache is None:
+            A2 = robust_Q2.T @ aa @ robust_Q2
+            A2 = 0.5 * (A2 + A2.T)
+            inv_sqrt_d2 = 1.0 / np.sqrt(robust_d2)
+            robust_Ahat_cache = inv_sqrt_d2[:, None] * A2 * inv_sqrt_d2[None, :]
+            robust_Ahat_cache = 0.5 * (robust_Ahat_cache + robust_Ahat_cache.T)
+
+        try:
+            ev = eigh(robust_Ahat_cache, subset_by_index=[idx, idx], eigvals_only=True)
+            return float(np.asarray(ev).reshape(-1)[0])
+        except TypeError:
+            ev_all = eigh(robust_Ahat_cache, eigvals_only=True)
+            return float(np.asarray(ev_all).reshape(-1)[idx])
+
+    def _first_discarded_from_keep_count(keep_count: int) -> float:
+        """Largest discarded eigenvalue in descending order, or NaN if none discarded."""
+        if nloc_total is None or keep_count >= nloc_total:
+            return float("nan")
+
+        if not robust_Sker_handling:
+            asc_idx = int(nloc_total - keep_count - 1)
+            return _query_nonrobust_generalized_eig_by_asc_index(asc_idx)
+
+        ztot = int(robust_z_total or 0)
+        boundary_rank_desc = int(keep_count) + 1
+        if boundary_rank_desc <= ztot:
+            return float("inf")
+
+        n2 = int(robust_n2 or 0)
+        finite_rank_desc = boundary_rank_desc - ztot  # 1=largest finite
+        asc_idx = int(n2 - finite_rank_desc)
+        if asc_idx < 0 or asc_idx >= n2:
+            return float("nan")
+        return _query_robust_finite_eig_by_asc_index(asc_idx)
 
     # # ---- selection + triplet insertion ----
     # if nev is not None:
@@ -515,7 +605,10 @@ def _lsdd_process_one_aggregate_gep(
         if finite_kept.size:
             level.eigs.min_ev = min(level.eigs.min_ev, float(np.min(finite_kept)))
 
-        level.eigs.nev[i] = int(E_keep.size)
+        keep_count = int(E_keep.size)
+        level.eigs.nev[i] = keep_count
+        if level.eigs.first_discarded is not None:
+            level.eigs.first_discarded[i] = _first_discarded_from_keep_count(keep_count)
 
         # Insert columns into P in the same order as E_keep: +inf first.
         t0 = perf_counter()
@@ -550,7 +643,9 @@ def _lsdd_process_one_aggregate_gep(
         counter += 1
 
     level.eigs.nev[i] = kept_count
-
+    if level.eigs.first_discarded is not None:
+        level.eigs.first_discarded[i] = _first_discarded_from_keep_count(int(kept_count))
+    #print(f"kept_vals for aggregate {i}: {kept_vals}")
     if eigvals_kept is not None:
         eigvals_kept.extend(kept_vals)
 

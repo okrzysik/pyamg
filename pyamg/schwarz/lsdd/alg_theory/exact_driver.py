@@ -28,11 +28,11 @@ from .models import (
 )
 from .observed import build_observed_two_level_solver as _build_observed_two_level_solver
 from .observed import estimate_qobs_homogeneous_two_grid as _estimate_qobs_homogeneous_two_grid
-from .operators import apply_B_block_jacobi as _apply_B_block_jacobi
 from .operators import apply_B_tilde as _apply_B_tilde
+from .operators import apply_WJ_numerator_operator as _apply_WJ_numerator_operator
 from .operators import apply_tildeM as _apply_tildeM
 from .operators import assemble_block_jacobi_matrix as _assemble_block_jacobi_matrix
-from .operators import build_block_jacobi_solver_from_matrix as _build_block_jacobi_solver_from_matrix
+from .operators import assemble_block_jacobi_solver as _assemble_block_jacobi_solver
 from .operators import build_linear_solver as _build_linear_solver
 from .operators import build_tilde_metric_ops as _build_tilde_metric_ops
 from .operators import build_tilde_projection_data as _build_tilde_projection_data
@@ -48,10 +48,10 @@ from .setup import build_one_level_lsdd as _build_one_level_lsdd
 from .setup import extract_level_diagnostics as _extract_level_diagnostics
 from .setup import prepare_local_projection_blocks as _prepare_local_projection_blocks
 from .spectral import draw_random_vector as _draw_random_vector
-from .spectral import lobpcg_MinvOp as _lobpcg_MinvOp
-from .spectral import power_iteration_AinvB as _power_iteration_AinvB
-from .spectral import power_MinvOp as _power_MinvOp
-from .spectral import projected_power_perp_MinvOp as _projected_power_perp_MinvOp
+from .spectral import lobpcg_metric_inverse_operator as _lobpcg_metric_inverse_operator
+from .spectral import power_metric_inverse_operator as _power_metric_inverse_operator
+from .spectral import power_generalized_eigen_matrix_free as _power_generalized_eigen_matrix_free
+from .spectral import power_metric_inverse_operator_projected as _power_metric_inverse_operator_projected
 
 
 def _rho_from_K(K: float | None) -> float | None:
@@ -139,7 +139,7 @@ def _compute_exact_block_jacobi_wap_on_level(
         raise ValueError("No local blocks were constructed; cannot compute W_M")
 
     def apply_B(x: np.ndarray) -> tuple[np.ndarray, float]:
-        return _apply_B_block_jacobi(x=x, local_blocks=local_blocks, n_fine=n_fine)
+        return _apply_WJ_numerator_operator(x=x, local_blocks=local_blocks, n_fine=n_fine)
 
     solve_A = _build_linear_solver(
         A=A_csr,
@@ -151,10 +151,10 @@ def _compute_exact_block_jacobi_wap_on_level(
 
     rng = np.random.default_rng(seed)
     x0 = _draw_random_vector(rng=rng, n=n_fine, distribution=distribution, dtype=A_csr.dtype)
-    lam, rel, anorm, conv = _power_iteration_AinvB(
-        A=A_csr,
-        apply_B=apply_B,
-        solve_A=solve_A,
+    lam, rel, anorm, conv = _power_generalized_eigen_matrix_free(
+        metric_matrix=A_csr,
+        apply_numerator=apply_B,
+        solve_metric=solve_A,
         x0=x0,
         maxiter=maxiter,
         tol=tol,
@@ -282,10 +282,10 @@ def _compute_exact_symmetric_metric_wap_on_level(
 
     rng = np.random.default_rng(seed)
     x0 = _draw_random_vector(rng=rng, n=n_fine, distribution=distribution, dtype=A_csr.dtype)
-    lam, rel, anorm, conv = _power_iteration_AinvB(
-        A=A_csr,
-        apply_B=apply_B,
-        solve_A=solve_A,
+    lam, rel, anorm, conv = _power_generalized_eigen_matrix_free(
+        metric_matrix=A_csr,
+        apply_numerator=apply_B,
+        solve_metric=solve_A,
         x0=x0,
         maxiter=maxiter,
         tol=tol,
@@ -367,7 +367,6 @@ def _compute_refined_chain_core(
     N_AJ_estimator = cfg.N_AJ_estimator
     N_AJ_perp_estimator = cfg.N_AJ_perp_estimator
     N_AJ_block_size = cfg.N_AJ_block_size
-    N_AJ_perp_block_size = cfg.N_AJ_perp_block_size
     maxiter_N_AJ = cfg.maxiter_N_AJ
     tol_N_AJ = cfg.tol_N_AJ
     miniter_N_AJ = cfg.miniter_N_AJ
@@ -428,7 +427,7 @@ def _compute_refined_chain_core(
     C_M = (P_T @ MP).toarray()
     C_M = 0.5 * (C_M + C_M.T)
     C_M_sys = _factor_dense_spd(C_M)
-    solve_J = _build_block_jacobi_solver_from_matrix(J=J, local_blocks=local_blocks)
+    solve_J = _assemble_block_jacobi_solver(local_blocks=local_blocks, n_fine=n_fine)
     _timer_add(timers, "stage.build_block_jacobi_ops_sec", perf_counter() - t_stage)
 
     def apply_J(x: np.ndarray) -> np.ndarray:
@@ -448,18 +447,16 @@ def _compute_refined_chain_core(
     N_AJ_estimator_used = str(N_AJ_estimator)
     if N_AJ_estimator == "lobpcg":
         try:
-            N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _lobpcg_MinvOp(
-                A=A_csr,
-                J=J,
-                solve_J=solve_J,
+            N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _lobpcg_metric_inverse_operator(
+                operator_matrix=A_csr,
+                metric_matrix=J,
+                solve_metric=solve_J,
                 n=n_fine,
                 block_size=N_AJ_block_size,
                 maxiter=maxiter_N_AJ,
                 tol=tol_N_AJ,
                 distribution=distribution,
                 seed=N_AJ_seed,
-                Y=None,
-                apply_QM_for_residual=None,
                 timers=timers,
                 timer_prefix="N_AJ.",
             )
@@ -469,10 +466,10 @@ def _compute_refined_chain_core(
                 RuntimeWarning,
             )
             N_AJ_estimator_used = "power_fallback"
-            N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _power_MinvOp(
-                apply_op=lambda x: np.asarray(A_csr @ x).reshape(-1),
-                apply_J=apply_J,
-                solve_J=solve_J,
+            N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _power_metric_inverse_operator(
+                apply_operator=lambda x: np.asarray(A_csr @ x).reshape(-1),
+                apply_metric=apply_J,
+                solve_metric=solve_J,
                 n=n_fine,
                 dtype=A_csr.dtype,
                 maxiter=maxiter_N_AJ,
@@ -484,10 +481,10 @@ def _compute_refined_chain_core(
                 timer_prefix="N_AJ.",
             )
     else:
-        N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _power_MinvOp(
-            apply_op=lambda x: np.asarray(A_csr @ x).reshape(-1),
-            apply_J=apply_J,
-            solve_J=solve_J,
+        N_AJ, N_AJ_hist, N_AJ_rel_hist, N_AJ_abs_res_hist, N_AJ_rel_res_hist, N_AJ_conv = _power_metric_inverse_operator(
+            apply_operator=lambda x: np.asarray(A_csr @ x).reshape(-1),
+            apply_metric=apply_J,
+            solve_metric=solve_J,
             n=n_fine,
             dtype=A_csr.dtype,
             maxiter=maxiter_N_AJ,
@@ -503,61 +500,30 @@ def _compute_refined_chain_core(
     t_stage = perf_counter()
     N_AJ_perp_method_eff = N_AJ_estimator if N_AJ_perp_estimator is None else N_AJ_perp_estimator
     N_AJ_perp_seed = None if seed is None else int(seed) + 17
-    N_AJ_perp_estimator_used = str(N_AJ_perp_method_eff)
     if N_AJ_perp_method_eff == "lobpcg":
-        try:
-            N_AJ_perp, N_AJ_perp_hist, N_AJ_perp_rel_hist, N_AJ_perp_abs_res_hist, N_AJ_perp_rel_res_hist, N_AJ_perp_conv = _lobpcg_MinvOp(
-                A=A_csr,
-                J=J,
-                solve_J=solve_J,
-                n=n_fine,
-                block_size=N_AJ_perp_block_size,
-                maxiter=maxiter_N_AJ_perp,
-                tol=tol_N_AJ_perp,
-                distribution=distribution,
-                seed=N_AJ_perp_seed,
-                Y=P,
-                apply_QM_for_residual=apply_QJ,
-                timers=timers,
-                timer_prefix="N_AJ_perp.",
-            )
-        except Exception as exc:
-            warn(
-                f"LOBPCG N_AJ_perp estimation failed ({exc!r}); falling back to projected power iteration.",
-                RuntimeWarning,
-            )
-            N_AJ_perp_estimator_used = "power_fallback"
-            N_AJ_perp, N_AJ_perp_hist, N_AJ_perp_rel_hist, N_AJ_perp_abs_res_hist, N_AJ_perp_rel_res_hist, N_AJ_perp_conv = _projected_power_perp_MinvOp(
-                apply_op=lambda x: np.asarray(A_csr @ x).reshape(-1),
-                apply_QM=apply_QJ,
-                apply_J=apply_J,
-                solve_J=solve_J,
-                n=n_fine,
-                dtype=A_csr.dtype,
-                maxiter=maxiter_N_AJ_perp,
-                tol=tol_N_AJ_perp,
-                miniter=miniter_N_AJ_perp,
-                distribution=distribution,
-                seed=N_AJ_perp_seed,
-                timers=timers,
-                timer_prefix="N_AJ_perp.",
-            )
-    else:
-        N_AJ_perp, N_AJ_perp_hist, N_AJ_perp_rel_hist, N_AJ_perp_abs_res_hist, N_AJ_perp_rel_res_hist, N_AJ_perp_conv = _projected_power_perp_MinvOp(
-            apply_op=lambda x: np.asarray(A_csr @ x).reshape(-1),
-            apply_QM=apply_QJ,
-            apply_J=apply_J,
-            solve_J=solve_J,
-            n=n_fine,
-            dtype=A_csr.dtype,
-            maxiter=maxiter_N_AJ_perp,
-            tol=tol_N_AJ_perp,
-            miniter=miniter_N_AJ_perp,
-            distribution=distribution,
-            seed=N_AJ_perp_seed,
-            timers=timers,
-            timer_prefix="N_AJ_perp.",
+        warn(
+            "N_AJ_perp_estimator='lobpcg' is unsupported with sparse coarse constraints; "
+            "using projected power iteration instead.",
+            RuntimeWarning,
         )
+        N_AJ_perp_estimator_used = "power_projected_forced"
+    else:
+        N_AJ_perp_estimator_used = str(N_AJ_perp_method_eff)
+    N_AJ_perp, N_AJ_perp_hist, N_AJ_perp_rel_hist, N_AJ_perp_abs_res_hist, N_AJ_perp_rel_res_hist, N_AJ_perp_conv = _power_metric_inverse_operator_projected(
+        apply_operator=lambda x: np.asarray(A_csr @ x).reshape(-1),
+        apply_projector=apply_QJ,
+        apply_metric=apply_J,
+        solve_metric=solve_J,
+        n=n_fine,
+        dtype=A_csr.dtype,
+        maxiter=maxiter_N_AJ_perp,
+        tol=tol_N_AJ_perp,
+        miniter=miniter_N_AJ_perp,
+        distribution=distribution,
+        seed=N_AJ_perp_seed,
+        timers=timers,
+        timer_prefix="N_AJ_perp.",
+    )
     _timer_add(timers, "stage.N_AJ_perp_total_sec", perf_counter() - t_stage)
 
     zeta_ref = _resolve_effective_damping(
@@ -608,10 +574,7 @@ def _compute_refined_chain_core(
             A=A,
             BT=BT,
             solver_params=solver_params,
-            zeta=float(zeta_input),
-            with_rho=bool(normalize_by_N_AJ),
-            with_rho_perp=bool(normalize_by_N_AJ_perp),
-            zeta_eff=float(zeta_ref),
+            zeta_raw=float(zeta_ref),
         )
         q_obs_solve, K_obs_solve = _estimate_qobs_homogeneous_two_grid(
             ml=ml_obs,
@@ -716,10 +679,10 @@ def _compute_refined_chain_core(
 
         rng = np.random.default_rng(None if seed is None else int(seed) + 2)
         x0_hat = _draw_random_vector(rng=rng, n=n_fine, distribution=distribution, dtype=A_csr.dtype)
-        lam_hat, _rel_hat, _an_hat, _conv_hat = _power_iteration_AinvB(
-            A=A_csr,
-            apply_B=apply_Bhat,
-            solve_A=solve_A,
+        lam_hat, _rel_hat, _an_hat, _conv_hat = _power_generalized_eigen_matrix_free(
+            metric_matrix=A_csr,
+            apply_numerator=apply_Bhat,
+            solve_metric=solve_A,
             x0=x0_hat,
             maxiter=maxiter_W_hat,
             tol=tol_W_hat,

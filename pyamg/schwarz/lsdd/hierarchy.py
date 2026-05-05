@@ -336,6 +336,7 @@ def _lsdd_extend_hierarchy(
                 level=level,
                 robust_Sker_handling=cfg.robust_Sker_handling,
                 nev=cfg.nev,
+                mult_threshold=cfg.mult_threshold,
                 min_coarsening=cfg.min_coarsening,
                 counter=counter,
                 p_r=p_r,

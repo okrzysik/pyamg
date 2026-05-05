@@ -83,6 +83,9 @@ class LSDDConfig:
         Target number of eigenvectors per aggregate to keep (before min-coarsening logic).
     threshold : float | None
         Optional eigenvalue threshold used by the eigenvector selection routine.
+    mult_threshold : float | None
+        Optional multiplicity-scaled eigenvalue threshold used by the eigenvector
+        selection routine.
     min_coarsening : int | None
         Minimum-coarsening control for whether/when to proceed with coarsening on this level.
     filteringA : tuple[bool, float] | None
@@ -116,6 +119,7 @@ class LSDDConfig:
     kappa: float
     nev: int | None
     threshold: float | None
+    mult_threshold: float | None
     min_coarsening: int | None
     filteringA: tuple[bool, float] | None
     filteringB: tuple[bool, float] | None
@@ -227,12 +231,17 @@ class EigenInfo:
     eigvals
         Optional list of length n_aggs storing accepted generalized eigenvalues per
         aggregate, in the same local-column order used to append columns into P.
+    first_discarded
+        float array of length n_aggs. `first_discarded[i]` stores the first
+        discarded generalized eigenvalue for aggregate i in descending spectral
+        order (i.e., the largest mode not kept). NaN indicates no discarded mode.
     """
 
     nev: IndexArray
     threshold: Optional[float] = None
     min_ev: float = float("inf")
     eigvals: Optional[list[np.ndarray]] = None
+    first_discarded: Optional[np.ndarray] = None
 
     @classmethod
     def allocate(cls, n_aggs: int) -> "EigenInfo":
@@ -240,6 +249,7 @@ class EigenInfo:
         return cls(
             nev=np.zeros(n_aggs, dtype=np.int32),
             eigvals=[np.empty(0, dtype=float) for _ in range(n_aggs)],
+            first_discarded=np.full(n_aggs, np.nan, dtype=float),
         )
 
 
