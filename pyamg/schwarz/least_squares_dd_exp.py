@@ -59,6 +59,11 @@ def least_squares_dd_solver_exp(
     print_info: bool = False,
     force_row_closure: bool = False,
     robust_Sker_handling: bool = True,
+    basis_scaling: str = "none",
+    basis_scaling_cond_max: float = 1.0e8,
+    basis_scaling_weight_power: float = 1.0,
+    basis_scaling_normalize_columns: bool = False,
+    basis_scaling_drop_tol: float = 0.0,
     **kwargs: Any,
 ) -> MultilevelSolver:
     """Build an LS–AMG–DD multilevel solver from a least-squares factor.
@@ -117,6 +122,21 @@ def least_squares_dd_solver_exp(
         If True, forces the R_rows_i sets to be closed under adjacency in B, which can be helpful for robustness in some cases. This is False by default, and is not an option in the original implementation
     robust_Sker_handling
         If True, applies a robust handling strategy for kernel of SPSD Schur complements (infinite-eigenvalue modes) in the local GEPs. False by default, and not an option in the original implementation. If False, the kernel of the Schur complement is regualrized-away via an identity perturbation.
+    basis_scaling
+        Optional aggregate-wise basis scaling applied after local eigenvector
+        selection and before prolongation assembly. Must be one of:
+        ``"none"``, ``"b_nodal"``, or ``"p_nodal"``.
+    basis_scaling_cond_max
+        Maximum accepted condition number for local row matrix ``C_i`` used by
+        basis scaling.
+    basis_scaling_weight_power
+        Exponent used when weighting candidate B-rows in ``"b_nodal"`` mode.
+        Set to 0.0 for unweighted selection.
+    basis_scaling_normalize_columns
+        If True, normalize each scaled local basis column after scaling.
+    basis_scaling_drop_tol
+        Relative threshold for dropping tiny entries in each scaled local basis
+        block before prolongation assembly.
         
     kwargs
         Forwarded to `MultilevelSolver`.
@@ -186,6 +206,17 @@ def least_squares_dd_solver_exp(
 
     if threshold is not None and mult_threshold is not None:
         raise ValueError('threshold and mult_threshold are mutually exclusive; set at most one')
+
+    if basis_scaling not in ("none", "b_nodal", "p_nodal"):
+        raise ValueError("basis_scaling must be one of 'none', 'b_nodal', or 'p_nodal'")
+    if basis_scaling_cond_max <= 0.0:
+        raise ValueError("basis_scaling_cond_max must be positive")
+    if basis_scaling_weight_power < 0.0:
+        raise ValueError("basis_scaling_weight_power must be nonnegative")
+    if basis_scaling_drop_tol < 0.0:
+        raise ValueError("basis_scaling_drop_tol must be nonnegative")
+    if basis_scaling != "none" and nev is not None:
+        raise ValueError("basis_scaling currently supports threshold mode only; set nev=None")
 
     if isinstance(mult_threshold, list):
         for mt in mult_threshold:
@@ -257,6 +288,11 @@ def least_squares_dd_solver_exp(
             robust_Sker_handling=robust_Sker_handling,
             explore_theory=not True,
             explore_theory_aggs=(0, ),   # or None for default sample
+            basis_scaling=basis_scaling,
+            basis_scaling_cond_max=float(basis_scaling_cond_max),
+            basis_scaling_weight_power=float(basis_scaling_weight_power),
+            basis_scaling_normalize_columns=bool(basis_scaling_normalize_columns),
+            basis_scaling_drop_tol=float(basis_scaling_drop_tol),
         )
 
         _lsdd_extend_hierarchy(

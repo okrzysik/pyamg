@@ -113,6 +113,23 @@ class LSDDConfig:
     explore_theory_aggs : tuple[int, ...] | None
         Optional aggregate indices to run exploratory hooks on. If None, a small
         default sample is chosen.
+    basis_scaling : str
+        Optional aggregate-wise basis scaling applied after local eigenvector
+        selection and before prolongation assembly. "none" leaves the current
+        algorithm unchanged. "b_nodal" selects rows from ``B[:, omega_i] Z_i``.
+        "p_nodal" selects rows from ``Z_i`` and is mainly for debugging.
+    basis_scaling_cond_max : float
+        Maximum accepted condition number for local row matrix ``C_i`` used by
+        scaling. Aggregates with worse conditioning are left unscaled.
+    basis_scaling_weight_power : float
+        Exponent used when weighting candidate B-rows during row pivoting.
+        Set to 0.0 for unweighted selection.
+    basis_scaling_normalize_columns : bool
+        If True, normalize each scaled local basis column after scaling.
+    basis_scaling_drop_tol : float
+        Relative drop tolerance applied to each scaled local basis block before
+        writing triplets. Entries with magnitude below
+        ``basis_scaling_drop_tol * max(abs(Z_i_scaled))`` are set to zero.
     """
 
     agg_levels: int
@@ -135,6 +152,13 @@ class LSDDConfig:
     # Optional exploratory theory hooks (disabled by default)
     explore_theory: bool = False
     explore_theory_aggs: tuple[int, ...] | None = None
+
+    # Optional basis scaling hooks (disabled by default)
+    basis_scaling: str = "none"
+    basis_scaling_cond_max: float = 1.0e8
+    basis_scaling_weight_power: float = 1.0
+    basis_scaling_normalize_columns: bool = False
+    basis_scaling_drop_tol: float = 0.0
 
 
 @dataclass(slots=True)

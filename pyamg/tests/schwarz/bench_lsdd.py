@@ -147,6 +147,35 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="exp only: Force closure of rows in aggregation",
     )
+    parser.add_argument(
+        "--basis-scaling",
+        choices=["none", "b_nodal", "p_nodal"],
+        default="none",
+        help="exp only: optional post-GEP basis scaling mode",
+    )
+    parser.add_argument(
+        "--basis-scaling-cond-max",
+        type=float,
+        default=1.0e8,
+        help="exp only: maximum accepted condition number for local scaling matrix",
+    )
+    parser.add_argument(
+        "--basis-scaling-weight-power",
+        type=float,
+        default=1.0,
+        help="exp only: row-weight exponent used in b_nodal pivot selection",
+    )
+    parser.add_argument(
+        "--basis-scaling-normalize-columns",
+        action="store_true",
+        help="exp only: normalize local columns after basis scaling",
+    )
+    parser.add_argument(
+        "--basis-scaling-drop-tol",
+        type=float,
+        default=0.0,
+        help="exp only: relative drop tolerance for tiny scaled basis entries",
+    )
     return parser.parse_args()
 
 
@@ -227,6 +256,11 @@ def main() -> None:
         exp_kwargs = {
             "robust_Sker_handling": args.robust_Sker_handling,
             "force_row_closure": args.force_row_closure,
+            "basis_scaling": args.basis_scaling,
+            "basis_scaling_cond_max": args.basis_scaling_cond_max,
+            "basis_scaling_weight_power": args.basis_scaling_weight_power,
+            "basis_scaling_normalize_columns": args.basis_scaling_normalize_columns,
+            "basis_scaling_drop_tol": args.basis_scaling_drop_tol,
         }
 
         print(f"\n=== {f.name} (n={n}) ===")

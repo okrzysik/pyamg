@@ -13,6 +13,8 @@ local_ops
     Extraction of local principal submatrices and local outer-product terms.
 eigs
     Per-aggregate generalized eigenvalue problems and eigenvector selection.
+basis_scaling
+    Optional post-GEP aggregate-wise basis scaling for prolongation triplets.
 hierarchy
     Helpers for assembling P/R, coarsening operators, and extending the hierarchy.
 smoothers
@@ -25,11 +27,12 @@ alg_theory
 
 from __future__ import annotations
 
-from . import alg_theory, aggregation, eigs, hierarchy, local_ops, smoothers, stats, subdomains, two_lvl_theory
+from . import alg_theory, aggregation, basis_scaling, eigs, hierarchy, local_ops, smoothers, stats, subdomains, two_lvl_theory
 
 __all__ = [
     "alg_theory",
     "aggregation",
+    "basis_scaling",
     "subdomains",
     "local_ops",
     "eigs",

@@ -223,6 +223,22 @@ def _lsdd_print_level_summary(
         print(f"{indent}       eig_d : {_mmx(stats.extra, 'eig_disc')}")
         print(f"{indent}       thr   : {_fmt(stats.extra.get('thr', 'n/a'))}")
 
+    method = stats.extra.get("basis_scaling_method")
+    if method and method != "none":
+        print(f"{indent}     basis scaling:")
+        print(f"{indent}       method : {method}")
+        print(f"{indent}       drop tol         : {_fmt(stats.extra.get('basis_scaling_drop_tol', 0.0))}")
+        print(f"{indent}       entries dropped  : {stats.extra.get('basis_scaling_entries_dropped', 0)}")
+        print(
+            f"{indent}       scaled : {stats.extra.get('basis_scaling_scaled', 0)} / "
+            f"{stats.extra.get('basis_scaling_total', 0)}"
+        )
+        print(f"{indent}       skip empty      : {stats.extra.get('basis_scaling_skipped_empty', 0)}")
+        print(f"{indent}       skip rows       : {stats.extra.get('basis_scaling_skipped_too_few_rows', 0)}")
+        print(f"{indent}       skip cond       : {stats.extra.get('basis_scaling_skipped_bad_conditioning', 0)}")
+        print(f"{indent}       skip exception  : {stats.extra.get('basis_scaling_skipped_exception', 0)}")
+        print(f"{indent}       cond            : {_mmx(stats.extra, 'basis_scaling_cond')}")
+
     # Optional RAS profile block (only if timing keys exist)
     ras_keys = [k for k in stats.timings if k.startswith("ras_")]
     if ras_keys:
@@ -265,6 +281,7 @@ def _lsdd_print_level_summary(
         "extract_A",
         "outerprod",
         "gep",
+        "basis_scale",
         "assemble_P",
         "prerel_stp",
         "pstrel_stp",

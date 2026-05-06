@@ -155,6 +155,8 @@ def _lsdd_coarsen_operators(*, A: SparseLike, B: SparseLike, P: SparseLike, R: S
     with stats.timeit("coarsen_sort"):
         A_c.sort_indices()
 
+    stats.extra["coarsen_A_nnz"] = int(A_c.nnz)
+
     # Pass-on metadata of A. Note that the solver requires both a valid "symmetry" attribute, and the A on all level to carry the "schwarz_use_cholesky" attribute as True.
     A_c.symmetry = getattr(A, "symmetry")
     A_c.schwarz_use_cholesky = True
@@ -175,6 +177,7 @@ def _lsdd_coarsen_operators(*, A: SparseLike, B: SparseLike, P: SparseLike, R: S
 
         with stats.timeit("coarsen_sort"):
             B_c.sort_indices()
+        stats.extra["coarsen_B_nnz"] = int(B_c.nnz)
     else:
         B_c = None
         
@@ -267,6 +270,9 @@ def _lsdd_extend_hierarchy(
     A = level.A
     B = level.B
 
+    if cfg.basis_scaling != "none" and cfg.nev is not None:
+        raise ValueError("basis_scaling currently supports threshold mode only; set nev=None")
+
     stats = LsddLevelStats(level=len(levels) - 1, n_fine=A.shape[0])
 
     # ---- optional filtering (not used on the finest level) ----
@@ -350,6 +356,25 @@ def _lsdd_extend_hierarchy(
     for k, dt in gep_timers.items():
         stats.timings[k] = dt
 
+    # ---- optional aggregate-local basis scaling ----
+    if cfg.basis_scaling != "none":
+        from .basis_scaling import _lsdd_scale_basis_triplets_for_fill
+
+        with stats.timeit("basis_scale"):
+            _lsdd_scale_basis_triplets_for_fill(
+                level=level,
+                B=B,
+                p_r=p_r,
+                p_c=p_c,
+                p_v=p_v,
+                method=cfg.basis_scaling,
+                cond_max=cfg.basis_scaling_cond_max,
+                weight_power=cfg.basis_scaling_weight_power,
+                normalize_columns=cfg.basis_scaling_normalize_columns,
+                drop_tol=cfg.basis_scaling_drop_tol,
+                stats=stats,
+            )
+
     # ---- optional exploratory theory hooks (development / diagnostics) ----
     if cfg.explore_theory:
         from .eigs import _lsdd_theory_outerprod_weighting_sweep
@@ -395,6 +420,9 @@ def _lsdd_extend_hierarchy(
             p_v=p_v,
             counter=counter,
         )
+        if cfg.basis_scaling != "none" and cfg.basis_scaling_drop_tol > 0.0:
+            level.P.eliminate_zeros()
+            level.P.sort_indices()
 
     # ---- coarsen operators ----
     with stats.timeit("coarsen"):
