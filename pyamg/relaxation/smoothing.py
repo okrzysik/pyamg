@@ -470,7 +470,8 @@ def rho_additive_schwarz_A(A, subdomain, subdomain_ptr, inv_subblock, inv_subblo
         matvec=matvec,
         dtype=np.result_type(A.dtype, inv_subblock.dtype),
     )
-    rho = float(approximate_spectral_radius(op))
+    rho = float(approximate_spectral_radius(op, restart=30, maxiter=30))
+    #rho = float(approximate_spectral_radius(op))
     if not np.isfinite(rho) or rho <= 0.0:
         raise ValueError(f"Estimated spectral radius for additive Schwarz must be positive, got {rho!r}")
     cache[key] = rho

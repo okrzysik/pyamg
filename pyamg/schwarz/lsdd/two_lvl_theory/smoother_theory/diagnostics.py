@@ -38,7 +38,7 @@ class SmootherDomainBoundDiagnostics:
     chi_exact_reason: str | None
     chi_exact_seconds: float | None
     chi_certified_by_pyamg: bool
-    dof_overlap_degree_color_bound: float | None
+    dof_overlap_degree_plus_one_bound: float | None
 
 
 def _as_csr_pattern(M, *, name: str) -> csr_array:
@@ -162,11 +162,24 @@ def _compute_exact_coloring(
     exact_coloring_max_edges: int | None,
 ) -> tuple[int | None, str, str | None, float | None, bool]:
     """Evaluate exact-coloring policy and return result tuple."""
-    if chi_pyamg is not None and chi_pyamg == nu:
-        return int(nu), "certified_by_pyamg", None, None, True
+    if chi_pyamg is not None and chi_pyamg < nu:
+        return (
+            None,
+            "invalid_coloring_lower_than_nu",
+            f"chi_pyamg={int(chi_pyamg)} < nu={int(nu)}",
+            None,
+            False,
+        )
+
+    # Policy handling:
+    # - never: never run exact coloring; may still certify when chi_pyamg == nu.
+    # - if_gap: certify when chi_pyamg == nu, otherwise run exact coloring.
+    # - always: always run exact coloring (subject to size/dependency guards).
     if exact_coloring == "never":
+        if chi_pyamg is not None and chi_pyamg == nu:
+            return int(nu), "certified_by_pyamg", None, None, True
         return None, "not_requested", None, None, False
-    if exact_coloring == "if_gap" and chi_pyamg is not None and chi_pyamg <= nu:
+    if exact_coloring == "if_gap" and chi_pyamg is not None and chi_pyamg == nu:
         return int(nu), "certified_by_pyamg", None, None, True
 
     n_vertices = int(C.shape[0])
@@ -216,10 +229,10 @@ def _compute_domain_diagnostics(
 
     lambda_max = compute_additive_schwarz_lambda_max_from_level(level, domain=domain)
 
-    dof_overlap_degree_color_bound = None
+    dof_overlap_degree_plus_one_bound = None
     if domain == "OMEGA":
         color_bound = getattr(level.sub, "number_of_colors", None)
-        dof_overlap_degree_color_bound = (
+        dof_overlap_degree_plus_one_bound = (
             float(color_bound) if color_bound is not None else None
         )
 
@@ -239,7 +252,7 @@ def _compute_domain_diagnostics(
         chi_exact_reason=chi_reason,
         chi_exact_seconds=chi_seconds,
         chi_certified_by_pyamg=bool(certified),
-        dof_overlap_degree_color_bound=dof_overlap_degree_color_bound,
+        dof_overlap_degree_plus_one_bound=dof_overlap_degree_plus_one_bound,
     )
 
 

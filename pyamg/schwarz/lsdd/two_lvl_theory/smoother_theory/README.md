@@ -16,7 +16,7 @@ Core outputs include:
 - `chi_exact` (exact chromatic number, when available/computed)
 - `chi_pyamg` (PyAMG coloring count upper bound)
 - incidence/interactions nnz diagnostics
-- `dof_overlap_degree_color_bound` for `OMEGA` (`level.sub.number_of_colors`)
+- `dof_overlap_degree_plus_one_bound` for `OMEGA` (`level.sub.number_of_colors`)
 
 ## Public API
 
@@ -75,7 +75,8 @@ Supported policy values:
 
 Certification shortcut:
 
-- If `chi_pyamg == nu`, then exact equality is certified (`nu <= chi_exact <= chi_pyamg`), so `chi_exact` is set to `nu` with status `certified_by_pyamg`.
+- For `never` and `if_gap`, if `chi_pyamg == nu`, exact equality is certified (`nu <= chi_exact <= chi_pyamg`), so `chi_exact` is set to `nu` with status `certified_by_pyamg`.
+- For `always`, exact coloring is still called (unless size/dependency guards block it).
 
 ## Installation Reminder for Optional Exact Coloring
 
