@@ -1,92 +1,122 @@
-# `smoother_theory`: Smoother-Side LS-DD Diagnostics
+# Smoother-theory diagnostics
 
-This subpackage contains **setup/sparsity/smoother diagnostics** for LS-DD levels, separated from the two-level solve diagnostics (`q_obs`, `K_obs`, `tau_max`, `W_J`).
+This folder contains diagnostics for the one-level smoother quantities used in
+LS-DD convergence-theory experiments.  The code is intentionally split into two
+files so that the graph algebra is separate from the high-level smoother
+constants.
 
-## Purpose
+## Files
 
-Given a prepared LS-DD level (or a setup-only context), compute domain-wise quantities for:
+- `smoother_graphs.py` builds the domain incidence matrices, interaction
+  graphs, and graph colorings.
+- `diagnostics.py` computes the smoother spectral quantity and packages the
+  scalar diagnostics for each requested domain layout.
+- `setup.py` remains responsible for building the one-level LS-DD context.
 
-- nonoverlapping block-Jacobi domain (`omega`)
-- overlapping additive-Schwarz domain (`OMEGA`)
+The intended call path is:
 
-Core outputs include:
+1. build the one-level context with `build_one_level_smoother_context`,
+2. call `compute_smoother_bound_diagnostics_from_level`,
+3. optionally use the returned graph matrices and color arrays for plotting.
 
-- `lambda_max(M^{-1}A)` (Schwarz/additive-Schwarz spectral factor)
-- `nu` (row-touching multiplicity bound)
-- `chi_exact` (exact chromatic number, when available/computed)
-- `chi_pyamg` (PyAMG coloring count upper bound)
-- incidence/interactions nnz diagnostics
-- `dof_overlap_degree_plus_one_bound` for `OMEGA` (`level.sub.number_of_colors`)
+## Domain layouts
 
-## Public API
+The diagnostics support two domain layouts.
 
-Exported from `__init__.py`:
+- `omega`: the nonoverlapping aggregate domains, using `level.AggOp` as the
+  DOF-by-domain incidence matrix.
+- `OMEGA`: the overlapping Schwarz domains, using
+  `level.sub.nodes_vs_subdomains` as the DOF-by-domain incidence matrix.
 
-- `build_one_level_smoother_context(...)`
-  - setup-only level builder (aggregation + overlap data + flattened subdomains)
-  - does **not** build coarse interpolation or local GEP-based coarse spaces
+In both cases the code calls this incidence matrix `D`.  The entry `D[p, i]`
+is one when global degree of freedom `p` belongs to domain `i`.
 
-- `compute_row_domain_incidence_from_level(level, domain=...)`
-- `build_row_interaction_matrix(E)`
-- `compute_additive_schwarz_lambda_max_from_level(level, domain=...)`
-- `compute_smoother_bound_diagnostics_from_level(...)`
-- `SmootherDomainBoundDiagnostics`
+## The matrices `E`, `C_G`, and `C_A`
 
-## TPL / Dependency Notes
+Let `A` be the assembled SPD matrix and let `G` be the stored LS/Gram factor
+`level.B`, so that the intended relation is `A = G.T @ G`.
 
-### Required for standard diagnostics
+The matrix `E` is the row-domain incidence matrix
 
-No new hard dependency beyond the existing PyAMG LS-DD stack:
-
-- NumPy / SciPy
-- PyAMG core + LS-DD internals
-
-These are used for:
-
-- sparse incidence construction
-- interaction matrix construction
-- PyAMG coloring (`pyamg.graph.vertex_coloring`)
-- Schwarz spectral-radius routine
-
-### Optional for exact coloring
-
-Exact coloring uses third-party libraries (TPLs):
-
-- `networkx`
-- `gcol`
-
-They are imported **lazily** only when exact coloring is requested and needed. They are not imported at module import time.
-
-How they are used:
-
-1. Build sparse interaction matrix `C` from row-domain incidence.
-2. Convert `C` to a NetworkX graph.
-3. Call `gcol.chromatic_number(G)` for exact chromatic number.
-
-If unavailable, exact-coloring status is reported as `missing_dependency`; the rest of the diagnostics still run.
-
-## Exact-Coloring Policy
-
-Supported policy values:
-
-- `never`: do not call exact coloring
-- `if_gap`: call exact coloring only when `chi_pyamg > nu`
-- `always`: call exact coloring whenever size guards permit
-
-Certification shortcut:
-
-- For `never` and `if_gap`, if `chi_pyamg == nu`, exact equality is certified (`nu <= chi_exact <= chi_pyamg`), so `chi_exact` is set to `nu` with status `certified_by_pyamg`.
-- For `always`, exact coloring is still called (unless size/dependency guards block it).
-
-## Installation Reminder for Optional Exact Coloring
-
-Install optional TPLs in the same Python environment as PyAMG:
-
-```bash
-python -m pip install networkx gcol
+```text
+E = pattern(G) @ D,
 ```
 
-## Scope Boundary
+interpreted Booleanly.  Thus `E[j, i] = 1` means that row `j` of `G` touches
+at least one DOF in domain `i`.  The multiplicity quantity reported as `nu` is
 
-This package is intentionally smoother-side. It does **not** compute two-level LS-DD metrics (observed two-grid constants, threshold/coarse-space metrics, or `W_J`).
+```text
+nu = max_j sum_i E[j, i].
+```
 
+The code builds two domain interaction graphs.
+
+### `C_G`
+
+```text
+C_G = offdiag_pattern(E.T @ E).
+```
+
+This graph connects two domains when some row of `G` touches both of them.  It
+is the graph naturally associated with the row-wise quantity `nu`.  If one row
+of `G` touches `r` domains, those `r` domains are pairwise adjacent in `C_G`,
+so `nu <= chi(C_G)`.
+
+### `C_A`
+
+```text
+C_A = offdiag_pattern(D.T @ pattern(A) @ D).
+```
+
+This graph connects two domains when the assembled matrix `A` has a stored
+nonzero coupling between DOFs in the two domains.  This is the graph used by
+the standard additive Schwarz coloring argument.  For exact additive Schwarz,
+`lambda_max(M_AS^{-1} A) <= chi(C_A)`.
+
+For consistent `A = G.T @ G` data, `C_A` should be a subgraph of `C_G`.
+They coincide when no row-outer-product assembly cancellations remove
+block-level interactions.
+
+## Coloring quantities
+
+The PyAMG coloring routine gives an upper bound on the chromatic number.  The
+field names therefore use `chi_bnd_pyamg_*`, not `chi_pyamg_*`.
+
+For each graph, the diagnostics may contain:
+
+- `chi_bnd_pyamg_G`: PyAMG upper-bound color count for `C_G`.
+- `chi_bnd_pyamg_A`: PyAMG upper-bound color count for `C_A`.
+- `chi_exact_G`: exact chromatic number of `C_G`, when requested.
+- `chi_exact_A`: exact chromatic number of `C_A`, when requested.
+
+Exact coloring is controlled by a boolean flag, `compute_exact_coloring`.  The
+old policy distinction between `never`, `if_gap`, and `always` is intentionally
+removed.  If exact coloring is requested and the graph exceeds an optional size
+guard, the code raises a clear error.
+
+## Sanity checks
+
+The diagnostics return `sanity_check_messages`.  An empty tuple means all
+checks passed.  The checks are postconditions only; they do not replace exact
+coloring by shortcut certification.
+
+The main checks are:
+
+- `C_A` should be a subgraph of `C_G`.
+- PyAMG and exact colorings, when present, should be valid graph colorings.
+- If `chi_exact_G` is present, then `nu <= chi_exact_G`.
+- If both exact values are present, then `chi_exact_A <= chi_exact_G`.
+- If `chi_exact_A` is present, then
+  `lambda_max(M_AS^{-1} A) <= chi_exact_A` up to the requested tolerance.
+
+## Plotting
+
+The graph matrices and coloring arrays are returned in the diagnostics object.
+Plotting should usually happen in the driver repository rather than inside this
+PyAMG module, because the driver side has access to mesh coordinates and
+aggregate centroids.
+
+The utility `interaction_matrix_to_networkx(C)` converts either `C_G` or `C_A`
+to a NetworkX graph.  A plotting script can then draw nodes at aggregate
+centroids and color them using either `colors_bnd_pyamg` or `colors_exact` from
+the corresponding `GraphColoringResult`.
